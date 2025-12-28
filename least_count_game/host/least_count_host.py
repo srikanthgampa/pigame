@@ -37,6 +37,39 @@ def load_card_image(card_name: str) -> pygame.Surface:
     return img
 
 
+def card_sort_key(card: str) -> tuple[int, int]:
+    """
+    Ascending: jokers, A, 2..10, J, Q, K; then suit.
+    Jokers are always zero-count.
+    """
+    if card in ("ZB", "ZR"):
+        rank = 0
+        suit = 0
+    else:
+        face = card[:-1]
+        suit_char = card[-1]
+        suit_order = {"S": 0, "C": 1, "D": 2, "H": 3}
+        suit = suit_order.get(suit_char, 9)
+        if face == "A":
+            rank = 1
+        elif face == "J":
+            rank = 11
+        elif face == "Q":
+            rank = 12
+        elif face == "K":
+            rank = 13
+        else:
+            try:
+                rank = int(face)
+            except Exception:
+                rank = 99
+    return (rank, suit)
+
+
+def sort_hand(pid: int) -> None:
+    hands[pid] = sorted(hands.get(pid, []), key=card_sort_key)
+
+
 def send_json(sock: socket.socket, payload: dict) -> None:
     # Newline-delimited JSON to avoid TCP message boundary bugs.
     data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
@@ -102,6 +135,7 @@ turn_order: list[int] = []
 current_turn_idx = 0
 game_started = False
 deck: list[str] = []
+turn_phase: dict[int, str] = {}  # pid -> "draw" | "discard"
 
 
 STATE_MENU = "menu"
@@ -128,11 +162,15 @@ panel_right = pygame.Rect(420, 40, 520, 560)
 
 discard_rect = pygame.Rect(770, 150, 150, 210)
 draw_pile_rect = pygame.Rect(600, 150, 150, 210)
-btn_draw = Button(pygame.Rect(600, 380, 150, 54), "Draw")
-btn_least = Button(pygame.Rect(770, 380, 150, 54), "Least Count")
+btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
 
 CARD_W, CARD_H = 92, 138
 HAND_Y = 460
+
+# Double-click handling (discard action)
+DOUBLE_CLICK_MS = 350
+last_click_ms = 0
+last_click_card: str | None = None
 
 def build_deck():
     values = [str(v) for v in range(2, 11)] + ["J","Q","K","A"]
@@ -160,6 +198,7 @@ def send_hand(pid: int) -> None:
     conn = connections.get(pid)
     if not conn:
         return
+    sort_hand(pid)
     try:
         send_json(conn, {"action": "hand", "hand": hands.get(pid, [])})
     except Exception:
@@ -167,9 +206,11 @@ def send_hand(pid: int) -> None:
 
 
 def broadcast_state() -> None:
+    current_pid = turn_order[current_turn_idx] if turn_order else None
     state_msg = {
         "discard_top": discard_pile[-1] if discard_pile else None,
-        "turn": turn_order[current_turn_idx] if turn_order else None,
+        "turn": current_pid,
+        "turn_phase": turn_phase.get(current_pid, "draw") if current_pid is not None else "draw",
         "deck_count": len(deck),
         "players": turn_order[:],
     }
@@ -181,7 +222,7 @@ def broadcast_state() -> None:
 
 
 def start_game() -> None:
-    global game_started, deck, discard_pile, turn_order, current_turn_idx, last_results
+    global game_started, deck, discard_pile, turn_order, current_turn_idx, last_results, turn_phase
     last_results = None
     game_started = True
     deck = build_deck()
@@ -190,11 +231,14 @@ def start_game() -> None:
     # Build turn order once, consistently.
     turn_order = [HOST_ID] + sorted(connections.keys())
     current_turn_idx = 0
+    turn_phase = {pid: "draw" for pid in turn_order}
 
     # Deal hands
     hands[HOST_ID] = [deck.pop() for _ in range(5)]
+    sort_hand(HOST_ID)
     for pid in sorted(connections.keys()):
         hands[pid] = [deck.pop() for _ in range(5)]
+        sort_hand(pid)
         send_hand(pid)
 
     # Flip one card to start discard pile (common for this style of game).
@@ -263,7 +307,7 @@ def next_turn() -> None:
         current_turn_idx = (current_turn_idx + 1) % len(turn_order)
 
 def end_game():
-    global game_started, last_results
+    global game_started, last_results, turn_phase
     scores = {pid: sum(card_value(c) for c in hands.get(pid, [])) for pid in hands}
     winner = min(scores, key=scores.get) if scores else None
     last_results = {"scores": scores, "winner": winner}
@@ -274,6 +318,7 @@ def end_game():
         except Exception:
             pass
     game_started = False
+    turn_phase = {}
     print("Game Over! Scores:", scores, "Winner:", winner)
 
 def card_value(card):
@@ -326,19 +371,30 @@ while running:
             continue
 
         is_turn = pid == turn_order[current_turn_idx]
-        if action == "discard" and is_turn:
+        phase = turn_phase.get(pid, "draw")
+        if action == "discard" and is_turn and phase == "discard":
             card = data.get("card")
             if isinstance(card, str) and card in hands.get(pid, []):
                 hands[pid].remove(card)
+                sort_hand(pid)
                 discard_pile.append(card)
                 send_hand(pid)
+                turn_phase[pid] = "draw"
                 next_turn()
                 broadcast_state()
-        elif action == "draw" and is_turn:
+        elif action == "draw_deck" and is_turn and phase == "draw":
             if deck:
                 hands[pid].append(deck.pop())
+                sort_hand(pid)
                 send_hand(pid)
-                next_turn()
+                turn_phase[pid] = "discard"
+                broadcast_state()
+        elif action == "draw_discard" and is_turn and phase == "draw":
+            if discard_pile:
+                hands[pid].append(discard_pile.pop())
+                sort_hand(pid)
+                send_hand(pid)
+                turn_phase[pid] = "discard"
                 broadcast_state()
         elif action == "least_count":
             end_game()
@@ -400,8 +456,11 @@ while running:
         turn = turn_order[current_turn_idx] if turn_order else None
         turn_text = "Your Turn" if turn == HOST_ID else f"Waiting for Player {turn}"
         screen.blit(FONT.render(turn_text, True, (255, 235, 120)), (panel_left.x + 20, 100))
+        phase = turn_phase.get(turn, "draw") if turn is not None else "draw"
+        phase_text = "Click deck/discard to draw" if (turn == HOST_ID and phase == "draw") else "Double-click a card to discard" if (turn == HOST_ID and phase == "discard") else ""
         screen.blit(FONT_SM.render(f"Deck: {len(deck)} cards", True, (210, 220, 235)), (panel_left.x + 20, 138))
-        draw_button(btn_draw, enabled=(turn == HOST_ID and bool(deck)))
+        if phase_text:
+            screen.blit(FONT_SM.render(phase_text, True, (205, 215, 230)), (panel_left.x + 20, 166))
         draw_button(btn_least, enabled=True)
 
     elif state == STATE_RESULTS:
@@ -423,6 +482,10 @@ while running:
         pygame.draw.rect(screen, (0, 0, 0), draw_pile_rect.move(0, 4), border_radius=14)
         pygame.draw.rect(screen, (35, 40, 52), draw_pile_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
+        # Joker peeking under the deck (zero count indicator)
+        peek_joker = pygame.transform.smoothscale(load_card_image("ZB"), (92, 130))
+        peek_joker = pygame.transform.rotate(peek_joker, -18)
+        screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
         back = pygame.transform.smoothscale(load_card_image("CardBack"), (120, 170))
         screen.blit(back, (draw_pile_rect.x + 15, draw_pile_rect.y + 18))
 
@@ -438,16 +501,17 @@ while running:
             blank = pygame.transform.smoothscale(load_card_image("BlankCard"), (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
-        # host hand
+        # host hand (sorted + overlapping)
+        sort_hand(HOST_ID)
+        hand_cards = hands.get(HOST_ID, [])
+        n = len(hand_cards)
+        available = panel_right.width - 44 - CARD_W
+        step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
         hx = panel_right.x + 22
         hy = HAND_Y
-        for i, card in enumerate(hands.get(HOST_ID, [])):
-            rect = pygame.Rect(hx + i * (CARD_W + 16), hy, CARD_W, CARD_H)
+        for i, card in enumerate(hand_cards):
+            rect = pygame.Rect(hx + i * step, hy, CARD_W, CARD_H)
             img = pygame.transform.smoothscale(load_card_image(card), (CARD_W, CARD_H))
-            if dragging_card == card:
-                mx, my = pygame.mouse.get_pos()
-                rect.x = mx + offset_x
-                rect.y = my + offset_y
             screen.blit(img, rect.topleft)
             pygame.draw.rect(screen, (10, 10, 10), rect, width=2, border_radius=8)
 
@@ -475,44 +539,59 @@ while running:
 
             elif state == STATE_PLAYING:
                 turn = turn_order[current_turn_idx] if turn_order else None
-                if btn_draw.rect.collidepoint(pos) and turn == HOST_ID:
-                    if deck:
-                        hands[HOST_ID].append(deck.pop())
-                        next_turn()
-                        broadcast_state()
-                elif btn_least.rect.collidepoint(pos):
+                phase = turn_phase.get(HOST_ID, "draw")
+
+                if btn_least.rect.collidepoint(pos):
                     end_game()
                     state = STATE_RESULTS
-
-                # drag cards from hand
-                hx = panel_right.x + 22
-                hy = HAND_Y
-                for i, card in enumerate(hands.get(HOST_ID, [])):
-                    rect = pygame.Rect(hx + i * (CARD_W + 16), hy, CARD_W, CARD_H)
-                    if rect.collidepoint(pos) and turn == HOST_ID:
-                        dragging_card = card
-                        offset_x = rect.x - pos[0]
-                        offset_y = rect.y - pos[1]
-                        break
+                elif turn == HOST_ID and phase == "draw" and draw_pile_rect.collidepoint(pos):
+                    if deck:
+                        hands[HOST_ID].append(deck.pop())
+                        sort_hand(HOST_ID)
+                        turn_phase[HOST_ID] = "discard"
+                        broadcast_state()
+                elif turn == HOST_ID and phase == "draw" and discard_rect.collidepoint(pos):
+                    if discard_pile:
+                        hands[HOST_ID].append(discard_pile.pop())
+                        sort_hand(HOST_ID)
+                        turn_phase[HOST_ID] = "discard"
+                        broadcast_state()
+                elif turn == HOST_ID and phase == "discard":
+                    # Double-click a hand card to discard it.
+                    sort_hand(HOST_ID)
+                    hand_cards = hands.get(HOST_ID, [])
+                    n = len(hand_cards)
+                    available = panel_right.width - 44 - CARD_W
+                    step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
+                    hx = panel_right.x + 22
+                    hy = HAND_Y
+                    clicked: str | None = None
+                    # Reverse so topmost (rightmost) card wins overlaps.
+                    for i in range(n - 1, -1, -1):
+                        card = hand_cards[i]
+                        rect = pygame.Rect(hx + i * step, hy, CARD_W, CARD_H)
+                        if rect.collidepoint(pos):
+                            clicked = card
+                            break
+                    if clicked:
+                        now = pygame.time.get_ticks()
+                        is_double = clicked == last_click_card and (now - last_click_ms) <= DOUBLE_CLICK_MS
+                        last_click_card = clicked
+                        last_click_ms = now
+                        if is_double and clicked in hands.get(HOST_ID, []):
+                            hands[HOST_ID].remove(clicked)
+                            sort_hand(HOST_ID)
+                            discard_pile.append(clicked)
+                            turn_phase[HOST_ID] = "draw"
+                            next_turn()
+                            broadcast_state()
 
             elif state == STATE_RESULTS:
                 if btn_back_menu.rect.collidepoint(pos):
                     state = STATE_MENU
                     status_line = "Select a game to host."
 
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            if state == STATE_PLAYING and dragging_card:
-                turn = turn_order[current_turn_idx] if turn_order else None
-                if turn == HOST_ID:
-                    # drop onto discard pile
-                    mx, my = event.pos
-                    drop_rect = pygame.Rect(mx + offset_x, my + offset_y, CARD_W, CARD_H)
-                    if discard_rect.colliderect(drop_rect):
-                        discard_pile.append(dragging_card)
-                        hands[HOST_ID].remove(dragging_card)
-                        next_turn()
-                        broadcast_state()
-                dragging_card = None
+        # (drag/drop removed; discard is done via double-click)
 
     pygame.display.flip()
     clock.tick(60)
