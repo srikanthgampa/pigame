@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
