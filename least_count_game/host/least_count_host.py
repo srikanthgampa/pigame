@@ -22,6 +22,7 @@ clock = pygame.time.Clock()
 FONT = pygame.font.SysFont("dejavusans", 26)
 FONT_SM = pygame.font.SysFont("dejavusans", 18)
 FONT_LG = pygame.font.SysFont("dejavusans", 44)
+FONT_XS = pygame.font.SysFont("dejavusans", 16)
 
 
 _image_cache: dict[str, pygame.Surface] = {}
@@ -42,7 +43,8 @@ def card_sort_key(card: str) -> tuple[int, int]:
     Ascending: jokers, A, 2..10, J, Q, K; then suit.
     Jokers are always zero-count.
     """
-    if card in ("ZB", "ZR"):
+    # Designated joker (picked card for the round) sorts first too.
+    if card == joker_card or card in ("ZB", "ZR"):
         rank = 0
         suit = 0
     else:
@@ -116,6 +118,35 @@ def draw_panel(rect: pygame.Rect, title: str | None = None) -> None:
         screen.blit(t, (rect.x + 14, rect.y + 12))
 
 
+class TextInput:
+    def __init__(self, rect: pygame.Rect, value: str = "") -> None:
+        self.rect = rect
+        self.value = value
+        self.active = False
+
+    def handle_event(self, event: pygame.event.Event) -> None:
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.active = self.rect.collidepoint(event.pos)
+        if event.type == pygame.KEYDOWN and self.active:
+            if event.key == pygame.K_BACKSPACE:
+                self.value = self.value[:-1]
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.active = False
+            else:
+                if len(self.value) < 6 and event.unicode and event.unicode.isprintable():
+                    if event.unicode.isdigit():
+                        self.value += event.unicode
+
+    def draw(self, label: str) -> None:
+        pygame.draw.rect(screen, (0, 0, 0), self.rect.move(0, 3), border_radius=10)
+        pygame.draw.rect(screen, (240, 245, 255) if self.active else (220, 225, 235), self.rect, border_radius=10)
+        pygame.draw.rect(screen, (30, 30, 30), self.rect, width=2, border_radius=10)
+        lab = FONT_SM.render(label, True, (230, 235, 245))
+        screen.blit(lab, (self.rect.x, self.rect.y - 22))
+        txt = FONT.render(self.value or "", True, (10, 10, 10))
+        screen.blit(txt, (self.rect.x + 10, self.rect.y + 10))
+
+
 # --- Networking / game state ---
 HOST_ID = 1
 PORT = 5000
@@ -137,6 +168,19 @@ game_started = False
 deck: list[str] = []
 turn_phase: dict[int, str] = {}  # pid -> "draw" | "discard"
 
+# Match / round rules
+HAND_SIZE = 7
+SHOW_LIMIT = 8
+SHOW_PENALTY = 40
+max_points_out = 200  # configurable: out if score > max_points_out (e.g. 200 -> out at 201)
+
+round_no = 0
+joker_card: str | None = None  # designated joker for the round (0 points)
+scores_total: dict[int, int] = {HOST_ID: 0}
+eliminated: set[int] = set()
+round_over = False
+last_round_summary: dict | None = None
+
 
 STATE_MENU = "menu"
 STATE_LOBBY = "lobby"
@@ -147,30 +191,31 @@ state = STATE_MENU
 status_line = "Select a game to host."
 last_results: dict | None = None
 
-dragging_card: str | None = None
-offset_x = 0
-offset_y = 0
-
 # UI layout
 btn_game_least = Button(pygame.Rect(60, 160, 320, 70), "Least Count")
 btn_to_lobby = Button(pygame.Rect(60, 250, 320, 54), "Create Lobby")
 btn_start = Button(pygame.Rect(60, 520, 320, 56), "Start Game")
 btn_back_menu = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
+btn_next_round = Button(pygame.Rect(760, 540, 180, 52), "Next Round")
 
-panel_left = pygame.Rect(40, 40, 360, 560)
-panel_right = pygame.Rect(420, 40, 520, 560)
+panel_left = pygame.Rect(40, 90, 360, 500)
 
-discard_rect = pygame.Rect(770, 150, 150, 210)
-draw_pile_rect = pygame.Rect(600, 150, 150, 210)
-btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
+score_bar = pygame.Rect(20, 10, 940, 64)
+
+# Game-table layout (full screen during play)
+draw_pile_rect = pygame.Rect(410, 200, 150, 210)
+discard_rect = pygame.Rect(580, 200, 150, 210)
+btn_show = Button(pygame.Rect(820, 140, 120, 36), "SHOW")
 
 CARD_W, CARD_H = 92, 138
-HAND_Y = 460
+HAND_Y = 450
 
 # Double-click handling (discard action)
 DOUBLE_CLICK_MS = 350
 last_click_ms = 0
 last_click_card: str | None = None
+
+points_input = TextInput(pygame.Rect(60, 360, 180, 50), value=str(max_points_out))
 
 def build_deck():
     values = [str(v) for v in range(2, 11)] + ["J","Q","K","A"]
@@ -180,11 +225,35 @@ def build_deck():
     random.shuffle(deck)
     return deck
 
+
+def card_points(card: str) -> int:
+    # 0 points for jokers + designated joker card for this round.
+    if card == joker_card or card in ("ZB", "ZR"):
+        return 0
+    face = card[:-1]
+    if face == "A":
+        return 1
+    if face in ("J", "Q", "K"):
+        return 10
+    try:
+        return int(face)
+    except Exception:
+        return 0
+
+
+def hand_total(pid: int) -> int:
+    return sum(card_points(c) for c in hands.get(pid, []))
+
 def broadcast_lobby() -> None:
     player_list = [{"id": HOST_ID, "name": player_names.get(HOST_ID, "Host")}]
     for pid in sorted(connections.keys()):
         player_list.append({"id": pid, "name": player_names.get(pid, f"Player {pid}")})
-    payload = {"action": "lobby", "players": player_list, "port": PORT}
+    payload = {
+        "action": "lobby",
+        "players": player_list,
+        "port": PORT,
+        "config": {"max_points_out": max_points_out, "hand_size": HAND_SIZE},
+    }
     for pid, conn in list(connections.items()):
         try:
             send_json(conn, payload)
@@ -213,6 +282,12 @@ def broadcast_state() -> None:
         "turn_phase": turn_phase.get(current_pid, "draw") if current_pid is not None else "draw",
         "deck_count": len(deck),
         "players": turn_order[:],
+        "scores_total": scores_total,
+        "eliminated": sorted(eliminated),
+        "round_no": round_no,
+        "joker_card": joker_card,
+        "round_over": round_over,
+        "max_points_out": max_points_out,
     }
     for pid, conn in list(connections.items()):
         try:
@@ -221,31 +296,52 @@ def broadcast_state() -> None:
             pass
 
 
-def start_game() -> None:
-    global game_started, deck, discard_pile, turn_order, current_turn_idx, last_results, turn_phase
-    last_results = None
+def start_match() -> None:
+    global game_started, scores_total, eliminated, round_no, last_round_summary
     game_started = True
+    last_round_summary = None
+    round_no = 0
+    eliminated = set()
+    scores_total = {HOST_ID: 0}
+    for pid in connections.keys():
+        scores_total[pid] = 0
+    start_round()
+
+
+def start_round() -> None:
+    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, round_no, round_over, last_round_summary
+    last_round_summary = None
+    round_over = False
+    round_no += 1
+
     deck = build_deck()
     discard_pile = []
 
-    # Build turn order once, consistently.
-    turn_order = [HOST_ID] + sorted(connections.keys())
+    # Active players exclude eliminated.
+    active = [HOST_ID] + [pid for pid in sorted(connections.keys()) if pid not in eliminated]
+    # If host is eliminated, also exclude them from play (but host still controls UI).
+    if HOST_ID in eliminated:
+        active = [pid for pid in active if pid != HOST_ID]
+
+    turn_order = active
     current_turn_idx = 0
     turn_phase = {pid: "draw" for pid in turn_order}
 
-    # Deal hands
-    hands[HOST_ID] = [deck.pop() for _ in range(5)]
-    sort_hand(HOST_ID)
-    for pid in sorted(connections.keys()):
-        hands[pid] = [deck.pop() for _ in range(5)]
-        sort_hand(pid)
-        send_hand(pid)
+    # Pick designated joker card for this round (actual card, 0 points for round).
+    joker_card = deck.pop() if deck else None
 
-    # Flip one card to start discard pile (common for this style of game).
+    # Deal hands
+    for pid in turn_order:
+        hands[pid] = [deck.pop() for _ in range(HAND_SIZE)]
+        sort_hand(pid)
+        if pid != HOST_ID:
+            send_hand(pid)
+
+    # Start discard pile
     if deck:
         discard_pile.append(deck.pop())
 
-    # Let clients know the game has started (they’ll also get update/hand messages).
+    # Inform clients
     for pid, conn in list(connections.items()):
         try:
             send_json(
@@ -253,13 +349,16 @@ def start_game() -> None:
                 {
                     "action": "start",
                     "rules": {
-                        "hand_size": 5,
-                        "notes": "Lowest total wins. On your turn: draw OR discard a card. Press 'Least Count' to end and score hands.",
+                        "hand_size": HAND_SIZE,
+                        "show_limit": SHOW_LIMIT,
+                        "show_penalty": SHOW_PENALTY,
+                        "max_points_out": max_points_out,
                     },
                 },
             )
         except Exception:
             pass
+        send_hand(pid)
 
     broadcast_state()
 
@@ -321,16 +420,74 @@ def end_game():
     turn_phase = {}
     print("Game Over! Scores:", scores, "Winner:", winner)
 
-def card_value(card):
-    if card in ["ZB","ZR"]: return 0
-    if card[0] == "A": return 1
-    if card[0] == "J": return 11
-    if card[0] == "Q": return 12
-    if card[0] == "K": return 13
-    try:
-        return int(card[:-1]) if card[:-1].isdigit() else int(card[0])
-    except:
-        return 0
+def resolve_show(show_pid: int) -> None:
+    """
+    Implements Least Count show rule:
+    - allowed only if hand_total(show_pid) <= SHOW_LIMIT
+    - if no other player has <= show_total -> show_pid gets 0, others get their totals
+    - else show_pid gets SHOW_PENALTY; players with lowest total get 0; others get their totals
+    Updates cumulative totals + elimination (> max_points_out) and marks round_over.
+    """
+    global round_over, last_round_summary
+
+    if round_over:
+        return
+    if show_pid not in turn_order:
+        return
+
+    totals = {pid: hand_total(pid) for pid in turn_order}
+    show_total = totals.get(show_pid, 999)
+    if show_total > SHOW_LIMIT:
+        return
+
+    others = {pid: tot for pid, tot in totals.items() if pid != show_pid}
+    other_has_same_or_less = any(tot <= show_total for tot in others.values())
+
+    round_points: dict[int, int] = {}
+    if not other_has_same_or_less:
+        round_points[show_pid] = 0
+        for pid, tot in others.items():
+            round_points[pid] = tot
+        outcome = "win"
+    else:
+        round_points[show_pid] = SHOW_PENALTY
+        min_other = min(others.values()) if others else show_total
+        for pid, tot in others.items():
+            round_points[pid] = 0 if tot == min_other else tot
+        outcome = "penalty"
+
+    for pid, pts in round_points.items():
+        scores_total[pid] = int(scores_total.get(pid, 0)) + int(pts)
+
+    newly_out: list[int] = []
+    for pid, total_pts in scores_total.items():
+        if pid in eliminated:
+            continue
+        if total_pts > max_points_out:
+            eliminated.add(pid)
+            newly_out.append(pid)
+
+    last_round_summary = {
+        "round_no": round_no,
+        "joker_card": joker_card,
+        "show_pid": show_pid,
+        "show_total": show_total,
+        "totals": totals,
+        "round_points": round_points,
+        "scores_total": scores_total,
+        "eliminated": sorted(eliminated),
+        "outcome": outcome,
+        "newly_out": newly_out,
+    }
+    round_over = True
+
+    # Tell clients round ended
+    for pid, conn in list(connections.items()):
+        try:
+            send_json(conn, {"action": "round_end", "summary": last_round_summary})
+        except Exception:
+            pass
+    broadcast_state()
 
 threading.Thread(target=accept_loop, daemon=True).start()
 
@@ -396,9 +553,8 @@ while running:
                 send_hand(pid)
                 turn_phase[pid] = "discard"
                 broadcast_state()
-        elif action == "least_count":
-            end_game()
-            state = STATE_RESULTS
+        elif action == "show" and is_turn:
+            resolve_show(pid)
 
     # --- Draw background ---
     screen.fill((14, 16, 20))
@@ -407,29 +563,30 @@ while running:
     pygame.draw.rect(screen, (0, 0, 0), pygame.Rect(0, 0, 980, 620), width=6)
 
     # Header
-    header = FONT_LG.render("Raspberry Pi Gaming Hub", True, (245, 248, 255))
-    screen.blit(header, (40, 6))
-    sub = FONT_SM.render("Host • Lobby • Least Count", True, (200, 210, 225))
-    screen.blit(sub, (44, 52))
-
-    draw_panel(panel_left, "Control")
-    draw_panel(panel_right, "Table")
+    header = FONT_LG.render("Least Count (Host)", True, (245, 248, 255))
+    screen.blit(header, (30, 12))
+    sub = FONT_SM.render("Setup → Start → Play rounds until players are out", True, (200, 210, 225))
+    screen.blit(sub, (34, 54))
 
     # Left panel content
     if state == STATE_MENU:
-        screen.blit(FONT.render("Select a game to host:", True, (230, 235, 245)), (panel_left.x + 20, 110))
+        draw_panel(panel_left, "Setup")
+        screen.blit(FONT.render("Select a game to host:", True, (230, 235, 245)), (panel_left.x + 20, 130))
         draw_button(btn_game_least, enabled=True)
+        points_input.draw("Out after points >")
+        screen.blit(FONT_XS.render("(Example: 200 → out at 201)", True, (205, 215, 230)), (points_input.rect.x, points_input.rect.bottom + 6))
         draw_button(btn_to_lobby, enabled=True)
         screen.blit(FONT_SM.render(status_line, True, (210, 220, 235)), (panel_left.x + 18, panel_left.bottom - 36))
 
     elif state == STATE_LOBBY:
-        screen.blit(FONT.render("Lobby", True, (230, 235, 245)), (panel_left.x + 20, 86))
+        draw_panel(panel_left, "Lobby")
+        screen.blit(FONT.render("Lobby", True, (230, 235, 245)), (panel_left.x + 20, 110))
         screen.blit(
             FONT_SM.render(f"Listening on port {PORT}. Connected players:", True, (200, 210, 225)),
-            (panel_left.x + 20, 122),
+            (panel_left.x + 20, 146),
         )
 
-        y = panel_left.y + 160
+        y = panel_left.y + 120
         chip_blue = pygame.transform.smoothscale(load_card_image("BlueChip"), (34, 34))
         chip_red = pygame.transform.smoothscale(load_card_image("RedChip"), (34, 34))
 
@@ -446,22 +603,48 @@ while running:
             )
             y += 44
 
-        can_start = True  # allow solo, but show status
+        can_start = True
         draw_button(btn_start, enabled=can_start)
         hint = "Tip: start with 1+ remote players, or play solo as Host."
         screen.blit(FONT_SM.render(hint, True, (205, 215, 230)), (panel_left.x + 18, panel_left.bottom - 36))
 
     elif state == STATE_PLAYING:
-        # Left: turn + controls
+        # Full-screen game table (no half-screen panels)
+        # Score bar at top
+        pygame.draw.rect(screen, (0, 0, 0), score_bar.move(0, 3), border_radius=14)
+        pygame.draw.rect(screen, (25, 28, 35), score_bar, border_radius=14)
+        pygame.draw.rect(screen, (90, 100, 120), score_bar, width=2, border_radius=14)
+
+        x = score_bar.x + 16
+        y = score_bar.y + 18
+        for pid in turn_order:
+            name = player_names.get(pid, f"Player {pid}") if pid != HOST_ID else "Host"
+            pts = scores_total.get(pid, 0)
+            out = " OUT" if pid in eliminated else ""
+            txt = FONT_SM.render(f"{name}: {pts}{out}", True, (235, 240, 248))
+            screen.blit(txt, (x, y))
+            x += txt.get_width() + 18
+
+        # Show per-hand totals at top-right for current round
+        totals_line = "  ".join([f"P{pid}:{hand_total(pid)}" for pid in turn_order])
+        screen.blit(FONT_XS.render(totals_line, True, (210, 220, 235)), (score_bar.x + 16, score_bar.y + 42))
+
+        # Turn hint
         turn = turn_order[current_turn_idx] if turn_order else None
-        turn_text = "Your Turn" if turn == HOST_ID else f"Waiting for Player {turn}"
-        screen.blit(FONT.render(turn_text, True, (255, 235, 120)), (panel_left.x + 20, 100))
         phase = turn_phase.get(turn, "draw") if turn is not None else "draw"
-        phase_text = "Click deck/discard to draw" if (turn == HOST_ID and phase == "draw") else "Double-click a card to discard" if (turn == HOST_ID and phase == "discard") else ""
-        screen.blit(FONT_SM.render(f"Deck: {len(deck)} cards", True, (210, 220, 235)), (panel_left.x + 20, 138))
-        if phase_text:
-            screen.blit(FONT_SM.render(phase_text, True, (205, 215, 230)), (panel_left.x + 20, 166))
-        draw_button(btn_least, enabled=True)
+        hint = ""
+        if not round_over and turn == HOST_ID:
+            hint = "Click deck/discard to draw" if phase == "draw" else "Double-click a card to discard"
+        elif round_over:
+            hint = "Round over. Click Next Round (host) to continue."
+        if hint:
+            screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, 92))
+
+        # Show button (only when host turn and <= show limit)
+        can_show = (not round_over) and (turn == HOST_ID) and (hand_total(HOST_ID) <= SHOW_LIMIT)
+        draw_button(btn_show, enabled=can_show)
+        if round_over:
+            draw_button(btn_next_round, enabled=True)
 
     elif state == STATE_RESULTS:
         screen.blit(FONT.render("Results", True, (230, 235, 245)), (panel_left.x + 20, 86))
@@ -476,14 +659,15 @@ while running:
                 y += 34
         draw_button(btn_back_menu, enabled=True)
 
-    # Right panel: table rendering (discard, draw pile, host hand)
+    # Game table (during play/results)
     if state in (STATE_PLAYING, STATE_RESULTS):
-        # draw pile
+        # Draw pile
         pygame.draw.rect(screen, (0, 0, 0), draw_pile_rect.move(0, 4), border_radius=14)
         pygame.draw.rect(screen, (35, 40, 52), draw_pile_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
-        # Joker peeking under the deck (zero count indicator)
-        peek_joker = pygame.transform.smoothscale(load_card_image("ZB"), (92, 130))
+        # Designated joker peeking under the deck (0 points for this round)
+        peek_name = joker_card or "ZB"
+        peek_joker = pygame.transform.smoothscale(load_card_image(peek_name), (92, 130))
         peek_joker = pygame.transform.rotate(peek_joker, -18)
         screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
         back = pygame.transform.smoothscale(load_card_image("CardBack"), (120, 170))
@@ -501,13 +685,14 @@ while running:
             blank = pygame.transform.smoothscale(load_card_image("BlankCard"), (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
-        # host hand (sorted + overlapping)
-        sort_hand(HOST_ID)
+        # Host hand (sorted + overlapping)
+        if HOST_ID in hands:
+            sort_hand(HOST_ID)
         hand_cards = hands.get(HOST_ID, [])
         n = len(hand_cards)
-        available = panel_right.width - 44 - CARD_W
+        available = 940 - 60 - CARD_W
         step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
-        hx = panel_right.x + 22
+        hx = 30
         hy = HAND_Y
         for i, card in enumerate(hand_cards):
             rect = pygame.Rect(hx + i * step, hy, CARD_W, CARD_H)
@@ -520,6 +705,9 @@ while running:
         if event.type == pygame.QUIT:
             running = False
 
+        if state == STATE_MENU:
+            points_input.handle_event(event)
+
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pos = event.pos
 
@@ -527,6 +715,14 @@ while running:
                 if btn_game_least.rect.collidepoint(pos):
                     status_line = "Least Count selected. Create a lobby to start."
                 elif btn_to_lobby.rect.collidepoint(pos):
+                    # Apply config
+                    try:
+                        val = int(points_input.value.strip() or "200")
+                        if val <= 0:
+                            val = 200
+                        max_points_out = val
+                    except Exception:
+                        max_points_out = 200
                     state = STATE_LOBBY
                     status_line = "Lobby created. Waiting for players to connect..."
                     player_names[HOST_ID] = "Host"
@@ -535,35 +731,39 @@ while running:
             elif state == STATE_LOBBY:
                 if btn_start.rect.collidepoint(pos):
                     state = STATE_PLAYING
-                    start_game()
+                    start_match()
 
             elif state == STATE_PLAYING:
                 turn = turn_order[current_turn_idx] if turn_order else None
                 phase = turn_phase.get(HOST_ID, "draw")
 
-                if btn_least.rect.collidepoint(pos):
-                    end_game()
-                    state = STATE_RESULTS
-                elif turn == HOST_ID and phase == "draw" and draw_pile_rect.collidepoint(pos):
+                if btn_next_round.rect.collidepoint(pos) and round_over:
+                    # Continue match if possible
+                    active = [pid for pid in turn_order if pid not in eliminated]
+                    if len(active) >= 1:
+                        start_round()
+                elif btn_show.rect.collidepoint(pos) and (not round_over) and (turn == HOST_ID) and (hand_total(HOST_ID) <= SHOW_LIMIT):
+                    resolve_show(HOST_ID)
+                elif (not round_over) and turn == HOST_ID and phase == "draw" and draw_pile_rect.collidepoint(pos):
                     if deck:
                         hands[HOST_ID].append(deck.pop())
                         sort_hand(HOST_ID)
                         turn_phase[HOST_ID] = "discard"
                         broadcast_state()
-                elif turn == HOST_ID and phase == "draw" and discard_rect.collidepoint(pos):
+                elif (not round_over) and turn == HOST_ID and phase == "draw" and discard_rect.collidepoint(pos):
                     if discard_pile:
                         hands[HOST_ID].append(discard_pile.pop())
                         sort_hand(HOST_ID)
                         turn_phase[HOST_ID] = "discard"
                         broadcast_state()
-                elif turn == HOST_ID and phase == "discard":
+                elif (not round_over) and turn == HOST_ID and phase == "discard":
                     # Double-click a hand card to discard it.
                     sort_hand(HOST_ID)
                     hand_cards = hands.get(HOST_ID, [])
                     n = len(hand_cards)
-                    available = panel_right.width - 44 - CARD_W
+                    available = 940 - 60 - CARD_W
                     step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
-                    hx = panel_right.x + 22
+                    hx = 30
                     hy = HAND_Y
                     clicked: str | None = None
                     # Reverse so topmost (rightmost) card wins overlaps.
