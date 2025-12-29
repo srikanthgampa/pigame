@@ -337,6 +337,8 @@ def broadcast_lobby() -> None:
         "players": player_list,
         "port": PORT,
         "config": {"max_points_out": max_points_out, "hand_size": HAND_SIZE},
+        "dealer_pid": dealer_pid,
+        "player_order": player_order,
     }
     for pid, conn in list(connections.items()):
         try:
@@ -345,11 +347,29 @@ def broadcast_lobby() -> None:
             pass
 
 
-def recompute_player_order() -> None:
+def sync_player_order() -> None:
+    """
+    Keep current custom order stable while syncing with connections.
+    - remove players who disconnected
+    - append new players at end (after host)
+    """
     global player_order, dealer_pid
-    player_order = [HOST_ID] + sorted(connections.keys())
+    current = set([HOST_ID] + list(connections.keys()))
+    # prune missing, keep relative order
+    player_order = [pid for pid in player_order if pid in current]
+    if HOST_ID not in player_order:
+        player_order.insert(0, HOST_ID)
+    # append any new players
+    for pid in sorted(current):
+        if pid not in player_order:
+            player_order.append(pid)
     if dealer_pid not in player_order:
         dealer_pid = player_order[0] if player_order else HOST_ID
+
+
+def recompute_player_order() -> None:
+    # Backwards-compat alias for older call sites.
+    sync_player_order()
 
 
 def send_hand(pid: int) -> None:
@@ -780,22 +800,42 @@ while running:
             (panel_left.x + 20, 146),
         )
 
+        # Table setup: dealer + play order
+        sync_player_order()
+        screen.blit(FONT_SM.render("Dealer & turn order (edit before Start):", True, (210, 220, 235)), (panel_left.x + 20, 178))
         y = panel_left.y + 120
-        chip_blue = pygame.transform.smoothscale(load_card_image("BlueChip"), (34, 34))
-        chip_red = pygame.transform.smoothscale(load_card_image("RedChip"), (34, 34))
+        row_h = 44
+        start_y = 220
 
-        # Host entry
-        screen.blit(chip_blue, (panel_left.x + 20, y))
-        screen.blit(FONT.render(f"{player_names.get(HOST_ID, 'Host')} (You)", True, (245, 245, 245)), (panel_left.x + 62, y + 2))
-        y += 48
+        for idx, pid in enumerate(player_order):
+            ry = start_y + idx * row_h
+            if ry + row_h > panel_left.bottom - 90:
+                break
+            name = "Host" if pid == HOST_ID else player_names.get(pid, f"Player {pid}")
+            is_dealer = pid == dealer_pid
+            # row background
+            row_rect = pygame.Rect(panel_left.x + 16, ry, panel_left.width - 32, 38)
+            pygame.draw.rect(screen, (30, 34, 42), row_rect, border_radius=10)
+            pygame.draw.rect(screen, (90, 100, 120), row_rect, width=1, border_radius=10)
 
-        for pid in sorted(connections.keys()):
-            screen.blit(chip_red, (panel_left.x + 20, y))
-            screen.blit(
-                FONT.render(player_names.get(pid, f"Player {pid}"), True, (240, 240, 240)),
-                (panel_left.x + 62, y + 2),
-            )
-            y += 44
+            # dealer toggle button
+            d_rect = pygame.Rect(row_rect.x + 8, row_rect.y + 7, 24, 24)
+            pygame.draw.rect(screen, (255, 235, 120) if is_dealer else (200, 210, 225), d_rect, border_radius=6)
+            screen.blit(FONT_XS.render("D", True, (20, 20, 20)), (d_rect.x + 7, d_rect.y + 4))
+
+            # up/down buttons
+            up_rect = pygame.Rect(row_rect.right - 56, row_rect.y + 7, 22, 22)
+            dn_rect = pygame.Rect(row_rect.right - 28, row_rect.y + 7, 22, 22)
+            pygame.draw.rect(screen, (220, 225, 235), up_rect, border_radius=6)
+            pygame.draw.rect(screen, (220, 225, 235), dn_rect, border_radius=6)
+            pygame.draw.polygon(screen, (20, 20, 20), [(up_rect.centerx, up_rect.y + 5), (up_rect.x + 5, up_rect.bottom - 5), (up_rect.right - 5, up_rect.bottom - 5)])
+            pygame.draw.polygon(screen, (20, 20, 20), [(dn_rect.centerx, dn_rect.bottom - 5), (dn_rect.x + 5, dn_rect.y + 5), (dn_rect.right - 5, dn_rect.y + 5)])
+
+            # order index + name
+            screen.blit(FONT_XS.render(f"{idx+1}.", True, (235, 240, 248)), (row_rect.x + 42, row_rect.y + 10))
+            screen.blit(FONT.render(name, True, (245, 245, 245)), (row_rect.x + 70, row_rect.y + 6))
+            if is_dealer:
+                screen.blit(FONT_XS.render("Dealer", True, (255, 235, 120)), (row_rect.x + 70, row_rect.y + 22))
 
         can_start = True
         draw_button(btn_start, enabled=can_start)
@@ -1062,6 +1102,32 @@ while running:
                     broadcast_lobby()
 
             elif state == STATE_LOBBY:
+                # Handle dealer/order UI clicks
+                sync_player_order()
+                row_h = 44
+                start_y = 220
+                for idx, pid in enumerate(player_order):
+                    ry = start_y + idx * row_h
+                    if ry + row_h > panel_left.bottom - 90:
+                        break
+                    row_rect = pygame.Rect(panel_left.x + 16, ry, panel_left.width - 32, 38)
+                    d_rect = pygame.Rect(row_rect.x + 8, row_rect.y + 7, 24, 24)
+                    up_rect = pygame.Rect(row_rect.right - 56, row_rect.y + 7, 22, 22)
+                    dn_rect = pygame.Rect(row_rect.right - 28, row_rect.y + 7, 22, 22)
+
+                    if d_rect.collidepoint(pos):
+                        dealer_pid = pid
+                        broadcast_lobby()
+                        break
+                    if up_rect.collidepoint(pos) and idx > 0:
+                        player_order[idx - 1], player_order[idx] = player_order[idx], player_order[idx - 1]
+                        broadcast_lobby()
+                        break
+                    if dn_rect.collidepoint(pos) and idx < len(player_order) - 1:
+                        player_order[idx + 1], player_order[idx] = player_order[idx], player_order[idx + 1]
+                        broadcast_lobby()
+                        break
+
                 if btn_start.rect.collidepoint(pos):
                     state = STATE_PLAYING
                     start_match()
