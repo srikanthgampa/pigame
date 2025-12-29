@@ -232,6 +232,10 @@ round_summary: dict | None = None
 hand_counts: dict = {}
 players_in_round: list[int] = []
 show_enabled: bool = False
+pick_discard_card: str | None = None
+round_history: list[dict] = []
+player_names: dict = {}
+scroll_rows_from_bottom = 0  # for scoreboard scrolling (round rows only)
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -305,6 +309,9 @@ def disconnect() -> None:
     last_results = None
     state = STATE_MENU
     status_line = "Disconnected."
+    # reset scoreboard scroll
+    global scroll_rows_from_bottom
+    scroll_rows_from_bottom = 0
 
 
 def send_action(action: str, card: str | None = None) -> None:
@@ -365,6 +372,7 @@ while running:
             deck_count = int(st.get("deck_count", 0) or 0)
             turn_phase = str(st.get("turn_phase", "discard") or "discard")
             show_enabled = bool(st.get("show_enabled", False))
+            pick_discard_card = st.get("pick_discard_card")
             joker_card = st.get("joker_card")
             joker_rank = st.get("joker_rank")
             scores_total = st.get("scores_total", {}) or {}
@@ -373,6 +381,8 @@ while running:
             round_over = bool(st.get("round_over", False))
             hand_counts = st.get("hand_counts", {}) or {}
             players_in_round = list(st.get("players", []) or [])
+            round_history = list(st.get("round_history", []) or [])
+            player_names = st.get("player_names", {}) or {}
             continue
 
         if action == "round_end":
@@ -437,35 +447,78 @@ while running:
         pygame.draw.rect(screen, (25, 28, 35), score_bar, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), score_bar, width=2, border_radius=14)
 
-        col_x = {
-            "player": score_bar.x + 16,
-            "total": score_bar.x + 520,
-            "status": score_bar.x + 650,
-            "cards": score_bar.x + 780,
-        }
-        header_y = score_bar.y + 10
-        screen.blit(FONT_SM.render("Player", True, (210, 220, 235)), (col_x["player"], header_y))
-        screen.blit(FONT_SM.render("Total", True, (210, 220, 235)), (col_x["total"], header_y))
-        screen.blit(FONT_SM.render("Status", True, (210, 220, 235)), (col_x["status"], header_y))
-        screen.blit(FONT_SM.render("Cards", True, (210, 220, 235)), (col_x["cards"], header_y))
-        screen.blit(
-            FONT_XS.render(f"Round {round_no} • Joker: {joker_rank or '-'}", True, (200, 210, 225)),
-            (score_bar.x + 980, header_y + 2),
-        )
+        # Scoreboard: columns are player names, rows are rounds. Total row + Cards row pinned at bottom.
+        header_h = 26
+        footer_h = 44
+        row_h = 18
+        inner = pygame.Rect(score_bar.x + 10, score_bar.y + 8, score_bar.width - 20, score_bar.height - 16)
+        # derive player order
+        pids = [int(p) for p in players_in_round] if players_in_round else sorted([int(k) for k in scores_total.keys() if str(k).isdigit()])
+        if player_id is not None and player_id in pids:
+            # keep local player as first column for readability
+            pids = [player_id] + [p for p in pids if p != player_id]
 
-        row_y = score_bar.y + 40
-        row_h = 20
-        all_pids = sorted(scores_total.keys(), key=lambda k: int(k) if str(k).isdigit() else 999)
-        for i, pid in enumerate(all_pids[:8]):
-            pts = scores_total.get(pid, 0)
-            pid_int = int(pid) if str(pid).isdigit() else None
-            status = "OUT" if (pid_int is not None and pid_int in eliminated) else ("TURN" if (pid_int is not None and pid_int == current_turn and not round_over) else "")
-            cards = hand_counts.get(pid_int, hand_counts.get(str(pid), "-"))
-            y = row_y + i * row_h
-            screen.blit(FONT_XS.render(f"P{pid}", True, (235, 240, 248)), (col_x["player"], y))
-            screen.blit(FONT_XS.render(str(pts), True, (235, 240, 248)), (col_x["total"], y))
-            screen.blit(FONT_XS.render(status, True, (255, 235, 120) if status == "TURN" else (235, 240, 248)), (col_x["status"], y))
-            screen.blit(FONT_XS.render(str(cards), True, (235, 240, 248)), (col_x["cards"], y))
+        # compute column widths
+        col0_w = 80  # "Round"/labels
+        remaining = max(1, inner.width - col0_w)
+        col_w = max(90, remaining // max(1, len(pids)))
+        max_cols = max(1, min(len(pids), remaining // 90))
+        pids = pids[:max_cols]
+
+        # header row (pinned)
+        header_rect = pygame.Rect(inner.x, inner.y, inner.width, header_h)
+        pygame.draw.rect(screen, (18, 20, 26), header_rect, border_radius=10)
+        screen.blit(FONT_XS.render("Round", True, (210, 220, 235)), (header_rect.x + 8, header_rect.y + 6))
+        for i, pid in enumerate(pids):
+            name = player_names.get(pid, player_names.get(str(pid), f"P{pid}"))
+            x = header_rect.x + col0_w + i * col_w
+            col_rect = pygame.Rect(x, header_rect.y, col_w, header_h)
+            if (pid == current_turn) and (not round_over):
+                pygame.draw.rect(screen, (255, 235, 120), col_rect, border_radius=10)
+                fg = (20, 20, 20)
+            else:
+                fg = (210, 220, 235)
+            screen.blit(FONT_XS.render(str(name)[:10], True, fg), (x + 6, header_rect.y + 6))
+
+        # scrollable round rows
+        body_rect = pygame.Rect(inner.x, inner.y + header_h, inner.width, inner.height - header_h - footer_h)
+        pygame.draw.rect(screen, (0, 0, 0), body_rect, width=1, border_radius=10)
+
+        # determine visible slice
+        rounds = list(round_history)
+        max_visible = max(1, body_rect.height // row_h)
+        start = max(0, len(rounds) - max_visible - scroll_rows_from_bottom)
+        end = min(len(rounds), start + max_visible)
+        y = body_rect.y
+        for idx in range(start, end):
+            entry = rounds[idx]
+            rno = entry.get("round_no", idx + 1)
+            pts_map = entry.get("round_points", {}) or {}
+            screen.blit(FONT_XS.render(str(rno), True, (235, 240, 248)), (body_rect.x + 8, y + 2))
+            for i, pid in enumerate(pids):
+                pts = pts_map.get(pid, pts_map.get(str(pid), 0))
+                x = body_rect.x + col0_w + i * col_w
+                screen.blit(FONT_XS.render(str(pts), True, (235, 240, 248)), (x + 6, y + 2))
+            y += row_h
+
+        # footer (pinned): Total + Cards
+        footer_rect = pygame.Rect(inner.x, inner.bottom - footer_h, inner.width, footer_h)
+        pygame.draw.rect(screen, (18, 20, 26), footer_rect, border_radius=10)
+        # Total row
+        screen.blit(FONT_XS.render("Total", True, (210, 220, 235)), (footer_rect.x + 8, footer_rect.y + 4))
+        for i, pid in enumerate(pids):
+            total = scores_total.get(pid, scores_total.get(str(pid), 0))
+            x = footer_rect.x + col0_w + i * col_w
+            screen.blit(FONT_XS.render(str(total), True, (235, 240, 248)), (x + 6, footer_rect.y + 4))
+        # Cards row
+        screen.blit(FONT_XS.render("Cards", True, (210, 220, 235)), (footer_rect.x + 8, footer_rect.y + 24))
+        for i, pid in enumerate(pids):
+            count = hand_counts.get(pid, hand_counts.get(str(pid), "-"))
+            x = footer_rect.x + col0_w + i * col_w
+            txt = str(count)
+            if (pid == current_turn) and (not round_over):
+                txt = f"{txt} *"
+            screen.blit(FONT_XS.render(txt, True, (235, 240, 248)), (x + 6, footer_rect.y + 24))
 
         # Current-round totals are hidden during play; shown only in round-end summary.
 
@@ -477,6 +530,10 @@ while running:
             hint = "Double-click a card to discard (first)" if turn_phase == "discard" else "Click deck/discard to pick (after discard)"
         if hint:
             screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, score_bar.bottom + 10))
+
+        # Show which discard card you will take this turn
+        if (not round_over) and (current_turn == player_id) and (turn_phase == "draw") and pick_discard_card:
+            screen.blit(FONT_XS.render(f"Discard pick: {pick_discard_card}", True, (210, 220, 235)), (30, score_bar.bottom + 34))
 
         # Show allowed only at the start of your turn (before discard/pick), and only when <= show limit.
         can_show = (not round_over) and (current_turn == player_id) and (turn_phase == "discard") and show_enabled and (hand_total(hand) <= show_limit)
@@ -613,6 +670,11 @@ while running:
         if event.type == pygame.VIDEORESIZE and not _is_fullscreen:
             window = pygame.display.set_mode(event.size, pygame.RESIZABLE)
 
+        if event.type == pygame.MOUSEWHEEL and state == STATE_PLAYING:
+            # scroll round rows inside scoreboard (up shows older rounds)
+            # keep pinned header + footer
+            scroll_rows_from_bottom = max(0, scroll_rows_from_bottom + (-event.y))
+
         if state == STATE_MENU:
             ip_input.handle_event(event)
             name_input.handle_event(event)
@@ -637,9 +699,6 @@ while running:
                     send_action("draw_deck")
                 elif current_turn == player_id and (not round_over) and turn_phase == "draw" and discard_rect.collidepoint(pos):
                     send_action("draw_discard")
-                elif current_turn == player_id and (not round_over) and turn_phase == "discard" and discard_rect.collidepoint(pos):
-                    # Reserve the currently-open discard card so you can still take it after discarding.
-                    send_action("reserve_discard")
                 elif current_turn == player_id and (not round_over) and turn_phase == "discard":
                     # Double-click a hand card to discard it.
                     hand = sort_hand(hand)
