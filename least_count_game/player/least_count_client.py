@@ -231,6 +231,7 @@ round_over: bool = False
 round_summary: dict | None = None
 hand_counts: dict = {}
 players_in_round: list[int] = []
+show_enabled: bool = False
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -363,6 +364,7 @@ while running:
             current_turn = st.get("turn")
             deck_count = int(st.get("deck_count", 0) or 0)
             turn_phase = str(st.get("turn_phase", "discard") or "discard")
+            show_enabled = bool(st.get("show_enabled", False))
             joker_card = st.get("joker_card")
             joker_rank = st.get("joker_rank")
             scores_total = st.get("scores_total", {}) or {}
@@ -476,8 +478,8 @@ while running:
         if hint:
             screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, score_bar.bottom + 10))
 
-        # Show allowed only before drawing in the current turn.
-        can_show = (not round_over) and (current_turn == player_id) and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit)
+        # Show allowed only at the start of your turn (before discard/pick), and only when <= show limit.
+        can_show = (not round_over) and (current_turn == player_id) and (turn_phase == "discard") and show_enabled and (hand_total(hand) <= show_limit)
         draw_button(btn_show, enabled=can_show)
         draw_button(btn_disconnect_game, enabled=True)
 
@@ -555,9 +557,7 @@ while running:
             screen.blit(FONT_XS.render(f"P{pid} ({count})", True, (235, 240, 248)), (rect.x + 10, rect.bottom - 20))
 
         active_pid = current_turn
-        # Arc layout: others on top arc, you at bottom center.
-        if player_id is not None:
-            _draw_seat(player_id, pygame.Rect(BASE_SIZE[0] // 2 - 70, BASE_SIZE[1] - 92, 140, 80), active_pid)
+        # Arc layout: other players on top arc (your own seat face-down is not shown).
         others = [pid for pid in players_in_round if pid != player_id]
         if others:
             arc_center_x = BASE_SIZE[0] // 2
@@ -631,12 +631,15 @@ while running:
             if state == STATE_PLAYING:
                 if btn_disconnect_game.rect.collidepoint(pos):
                     disconnect()
-                if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit):
+                if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (turn_phase == "discard") and show_enabled and (hand_total(hand) <= show_limit):
                     send_action("show")
                 elif current_turn == player_id and (not round_over) and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
                     send_action("draw_deck")
                 elif current_turn == player_id and (not round_over) and turn_phase == "draw" and discard_rect.collidepoint(pos):
                     send_action("draw_discard")
+                elif current_turn == player_id and (not round_over) and turn_phase == "discard" and discard_rect.collidepoint(pos):
+                    # Reserve the currently-open discard card so you can still take it after discarding.
+                    send_action("reserve_discard")
                 elif current_turn == player_id and (not round_over) and turn_phase == "discard":
                     # Double-click a hand card to discard it.
                     hand = sort_hand(hand)
