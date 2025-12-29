@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import queue
 import socket
 import sys
@@ -14,11 +15,27 @@ BASE_DIR = Path(__file__).resolve().parents[1]  # /least_count_game
 ASSETS_DIR = BASE_DIR / "assets" / "cards"
 
 pygame.init()
-WINDOWED_SIZE = (980, 620)
+BASE_SIZE = (1280, 720)  # virtual canvas; we scale to window size
+WINDOWED_SIZE = BASE_SIZE
 _is_fullscreen = False
-screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+window = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE)
+screen = pygame.Surface(BASE_SIZE)
 pygame.display.set_caption("Raspberry Pi Gaming Hub (Player)")
 clock = pygame.time.Clock()
+
+
+def to_canvas(pos: tuple[int, int]) -> tuple[int, int]:
+    wx, wy = pos
+    win_w, win_h = window.get_size()
+    if win_w <= 0 or win_h <= 0:
+        return (0, 0)
+    cx = int(wx * BASE_SIZE[0] / win_w)
+    cy = int(wy * BASE_SIZE[1] / win_h)
+    return (max(0, min(BASE_SIZE[0] - 1, cx)), max(0, min(BASE_SIZE[1] - 1, cy)))
+
+
+def mouse_canvas_pos() -> tuple[int, int]:
+    return to_canvas(pygame.mouse.get_pos())
 
 FONT = pygame.font.SysFont("dejavusans", 26)
 FONT_SM = pygame.font.SysFont("dejavusans", 18)
@@ -122,7 +139,7 @@ class Button:
 
 
 def draw_button(btn: Button, enabled: bool = True) -> None:
-    mouse = pygame.mouse.get_pos()
+    mouse = mouse_canvas_pos()
     hovering = btn.rect.collidepoint(mouse)
     base = (55, 155, 200) if enabled else (70, 70, 70)
     hover = (70, 175, 230) if enabled else (70, 70, 70)
@@ -153,7 +170,7 @@ class TextInput:
 
     def handle_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            self.active = self.rect.collidepoint(event.pos)
+            self.active = self.rect.collidepoint(to_canvas(event.pos))
         if event.type == pygame.KEYDOWN and self.active:
             if event.key == pygame.K_BACKSPACE:
                 self.value = self.value[:-1]
@@ -220,20 +237,22 @@ panel_left = pygame.Rect(40, 40, 360, 560)
 panel_right = pygame.Rect(420, 40, 520, 560)
 
 btn_game_least = Button(pygame.Rect(60, 160, 320, 70), "Least Count")
-btn_connect = Button(pygame.Rect(60, 330, 320, 56), "Connect")
+btn_connect = Button(pygame.Rect(60, 420, 320, 56), "Connect")
 btn_disconnect = Button(pygame.Rect(60, 520, 320, 56), "Disconnect")
 btn_back = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
 
-draw_pile_rect = pygame.Rect(600, 150, 150, 210)
-discard_rect = pygame.Rect(770, 150, 150, 210)
+_pile_w, _pile_h = 160, 224
+draw_pile_rect = pygame.Rect(BASE_SIZE[0] // 2 - 190, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
+discard_rect = pygame.Rect(BASE_SIZE[0] // 2 + 30, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
-btn_show = Button(pygame.Rect(820, 140, 120, 36), "SHOW")
-btn_disconnect_game = Button(pygame.Rect(890, 82, 80, 32), "Exit")
+btn_show = Button(pygame.Rect(BASE_SIZE[0] - 170, 128, 120, 36), "SHOW")
+btn_disconnect_game = Button(pygame.Rect(BASE_SIZE[0] - 110, 20, 90, 32), "Exit")
 
 CARD_W, CARD_H = 92, 138
-HAND_Y = 460
+HAND_Y = BASE_SIZE[1] - 190
 
 ip_input = TextInput(pygame.Rect(60, 250, 320, 50), value=host_ip)
+name_input = TextInput(pygame.Rect(60, 340, 320, 50), value=player_name)
 status_line = "Select Least Count, then connect to the host."
 
 # Double-click handling (discard action)
@@ -247,7 +266,7 @@ def connected() -> bool:
 
 
 def connect_to_host() -> None:
-    global client, net_thread, state, status_line
+    global client, net_thread, state, status_line, player_name
     if client is not None:
         return
     try:
@@ -256,6 +275,7 @@ def connect_to_host() -> None:
         client = sock
         net_thread = threading.Thread(target=recv_loop, args=(sock, inbox), daemon=True)
         net_thread.start()
+        player_name = name_input.value.strip()
         if player_name:
             try:
                 send_json(sock, {"action": "hello", "name": player_name})
@@ -385,6 +405,7 @@ while running:
         screen.blit(FONT.render("Select game:", True, (230, 235, 245)), (panel_left.x + 20, 110))
         draw_button(btn_game_least, enabled=True)
         ip_input.draw("Host IP")
+        name_input.draw("Player name")
         draw_button(btn_connect, enabled=True)
         screen.blit(FONT_SM.render(status_line, True, (210, 220, 235)), (panel_left.x + 18, panel_left.bottom - 36))
 
@@ -409,21 +430,40 @@ while running:
 
     elif state == STATE_PLAYING:
         # Simplified full-screen play view: scoreboard + table + hand
-        score_bar = pygame.Rect(20, 10, 940, 64)
+        score_bar = pygame.Rect(20, 10, BASE_SIZE[0] - 40, 110)
         pygame.draw.rect(screen, (0, 0, 0), score_bar.move(0, 3), border_radius=14)
         pygame.draw.rect(screen, (25, 28, 35), score_bar, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), score_bar, width=2, border_radius=14)
 
-        # Totals (top) + per-round hand totals (from host)
-        x = score_bar.x + 16
-        y = score_bar.y + 18
-        # show in player-id order if possible
-        for pid in sorted(scores_total.keys(), key=lambda k: int(k) if str(k).isdigit() else 999):
+        col_x = {
+            "player": score_bar.x + 16,
+            "total": score_bar.x + 520,
+            "status": score_bar.x + 650,
+            "cards": score_bar.x + 780,
+        }
+        header_y = score_bar.y + 10
+        screen.blit(FONT_SM.render("Player", True, (210, 220, 235)), (col_x["player"], header_y))
+        screen.blit(FONT_SM.render("Total", True, (210, 220, 235)), (col_x["total"], header_y))
+        screen.blit(FONT_SM.render("Status", True, (210, 220, 235)), (col_x["status"], header_y))
+        screen.blit(FONT_SM.render("Cards", True, (210, 220, 235)), (col_x["cards"], header_y))
+        screen.blit(
+            FONT_XS.render(f"Round {round_no} • Joker: {joker_rank or '-'}", True, (200, 210, 225)),
+            (score_bar.x + 980, header_y + 2),
+        )
+
+        row_y = score_bar.y + 40
+        row_h = 20
+        all_pids = sorted(scores_total.keys(), key=lambda k: int(k) if str(k).isdigit() else 999)
+        for i, pid in enumerate(all_pids[:8]):
             pts = scores_total.get(pid, 0)
-            out = " OUT" if int(pid) in eliminated else ""
-            txt = FONT_SM.render(f"P{pid}:{pts}{out}", True, (235, 240, 248))
-            screen.blit(txt, (x, y))
-            x += txt.get_width() + 14
+            pid_int = int(pid) if str(pid).isdigit() else None
+            status = "OUT" if (pid_int is not None and pid_int in eliminated) else ("TURN" if (pid_int is not None and pid_int == current_turn and not round_over) else "")
+            cards = hand_counts.get(pid_int, hand_counts.get(str(pid), "-"))
+            y = row_y + i * row_h
+            screen.blit(FONT_XS.render(f"P{pid}", True, (235, 240, 248)), (col_x["player"], y))
+            screen.blit(FONT_XS.render(str(pts), True, (235, 240, 248)), (col_x["total"], y))
+            screen.blit(FONT_XS.render(status, True, (255, 235, 120) if status == "TURN" else (235, 240, 248)), (col_x["status"], y))
+            screen.blit(FONT_XS.render(str(cards), True, (235, 240, 248)), (col_x["cards"], y))
 
         # Current-round totals are hidden during play; shown only in round-end summary.
 
@@ -434,7 +474,7 @@ while running:
         elif current_turn == player_id:
             hint = "Double-click a card to discard (first)" if turn_phase == "discard" else "Click deck/discard to pick (after discard)"
         if hint:
-            screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, 92))
+            screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, score_bar.bottom + 10))
 
         # Show allowed only before drawing in the current turn.
         can_show = (not round_over) and (current_turn == player_id) and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit)
@@ -483,7 +523,7 @@ while running:
         # hand (sorted + overlapping)
         hand = sort_hand(hand)
         n = len(hand)
-        available = 940 - 60 - CARD_W
+        available = BASE_SIZE[0] - 60 - CARD_W
         step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
         hx = 30
         for i, card in enumerate(hand):
@@ -496,6 +536,9 @@ while running:
         def _draw_seat(pid: int, rect: pygame.Rect, active_pid: int | None) -> None:
             is_active = (active_pid == pid) and (not round_over)
             if is_active:
+                halo = pygame.Surface(rect.inflate(90, 50).size, pygame.SRCALPHA)
+                pygame.draw.ellipse(halo, (255, 235, 120, 55), halo.get_rect())
+                screen.blit(halo, halo.get_rect(center=rect.center))
                 pygame.draw.rect(screen, (255, 235, 120), rect.inflate(16, 16), width=4, border_radius=14)
             pygame.draw.rect(screen, (0, 0, 0), rect.move(0, 3), border_radius=12)
             pygame.draw.rect(screen, (25, 28, 35), rect, border_radius=12)
@@ -512,15 +555,25 @@ while running:
             screen.blit(FONT_XS.render(f"P{pid} ({count})", True, (235, 240, 248)), (rect.x + 10, rect.bottom - 20))
 
         active_pid = current_turn
-        # Local player seat bottom-left
+        # Arc layout: others on top arc, you at bottom center.
         if player_id is not None:
-            _draw_seat(player_id, pygame.Rect(30, 540, 140, 80), active_pid)
+            _draw_seat(player_id, pygame.Rect(BASE_SIZE[0] // 2 - 70, BASE_SIZE[1] - 92, 140, 80), active_pid)
         others = [pid for pid in players_in_round if pid != player_id]
         if others:
-            total_w = 920
-            step = total_w // max(1, len(others))
-            for i, pid in enumerate(others):
-                seat = pygame.Rect(30 + i * step, 100, 140, 80)
+            arc_center_x = BASE_SIZE[0] // 2
+            arc_top_y = score_bar.bottom + 20
+            radius = 520
+            start_deg = -62
+            end_deg = 62
+            if len(others) == 1:
+                angles = [0.0]
+            else:
+                angles = [start_deg + (end_deg - start_deg) * (i / (len(others) - 1)) for i in range(len(others))]
+            for pid, deg in zip(others, angles):
+                theta = math.radians(deg)
+                x = arc_center_x + radius * math.sin(theta)
+                y = arc_top_y + int(110 * (1 - math.cos(theta)))
+                seat = pygame.Rect(int(x - 70), int(y), 140, 80)
                 _draw_seat(pid, seat, active_pid)
 
     elif state == STATE_RESULTS:
@@ -537,6 +590,7 @@ while running:
         draw_button(btn_disconnect, enabled=True)
         draw_button(btn_back, enabled=True)
 
+    window.blit(pygame.transform.smoothscale(screen, window.get_size()), (0, 0))
     pygame.display.flip()
     clock.tick(60)
 
@@ -549,21 +603,22 @@ while running:
             if event.key == pygame.K_F11:
                 _is_fullscreen = not _is_fullscreen
                 if _is_fullscreen:
-                    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN | pygame.SCALED)
+                    window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
                 else:
-                    screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+                    window = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE)
             elif event.key == pygame.K_ESCAPE and _is_fullscreen:
                 _is_fullscreen = False
-                screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+                window = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE)
 
         if event.type == pygame.VIDEORESIZE and not _is_fullscreen:
-            screen = pygame.display.set_mode(event.size, pygame.RESIZABLE | pygame.SCALED)
+            window = pygame.display.set_mode(event.size, pygame.RESIZABLE)
 
         if state == STATE_MENU:
             ip_input.handle_event(event)
+            name_input.handle_event(event)
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            pos = event.pos
+            pos = to_canvas(event.pos)
 
             if state == STATE_MENU:
                 if btn_connect.rect.collidepoint(pos):
@@ -586,7 +641,7 @@ while running:
                     # Double-click a hand card to discard it.
                     hand = sort_hand(hand)
                     n = len(hand)
-                    available = 940 - 60 - CARD_W
+                    available = BASE_SIZE[0] - 60 - CARD_W
                     step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
                     hx = 30
                     clicked: str | None = None
