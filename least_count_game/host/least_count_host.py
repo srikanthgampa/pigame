@@ -277,11 +277,10 @@ def send_hand(pid: int) -> None:
 
 def broadcast_state() -> None:
     current_pid = turn_order[current_turn_idx] if turn_order else None
-    hand_totals = {pid: hand_total(pid) for pid in turn_order}
     state_msg = {
         "discard_top": discard_pile[-1] if discard_pile else None,
         "turn": current_pid,
-        "turn_phase": turn_phase.get(current_pid, "draw") if current_pid is not None else "draw",
+        "turn_phase": turn_phase.get(current_pid, "discard") if current_pid is not None else "discard",
         "deck_count": len(deck),
         "players": turn_order[:],
         "scores_total": scores_total,
@@ -289,7 +288,6 @@ def broadcast_state() -> None:
         "round_no": round_no,
         "joker_card": joker_card,
         "joker_rank": joker_rank,
-        "hand_totals": hand_totals,
         "round_over": round_over,
         "max_points_out": max_points_out,
     }
@@ -329,7 +327,8 @@ def start_round() -> None:
 
     turn_order = active
     current_turn_idx = 0
-    turn_phase = {pid: "draw" for pid in turn_order}
+    # Rule: discard first, then pick.
+    turn_phase = {pid: "discard" for pid in turn_order}
 
     # Pick designated joker card for this round (actual card, 0 points for round).
     joker_card = deck.pop() if deck else None
@@ -358,6 +357,7 @@ def start_round() -> None:
                         "show_limit": SHOW_LIMIT,
                         "show_penalty": SHOW_PENALTY,
                         "max_points_out": max_points_out,
+                        "discard_first": True,
                     },
                 },
             )
@@ -446,7 +446,8 @@ def resolve_show(show_pid: int) -> None:
         return
 
     others = {pid: tot for pid, tot in totals.items() if pid != show_pid}
-    other_has_same_or_less = any(tot <= show_total for tot in others.values())
+    same_or_less_players = [pid for pid, tot in others.items() if tot <= show_total]
+    other_has_same_or_less = len(same_or_less_players) > 0
 
     round_points: dict[int, int] = {}
     if not other_has_same_or_less:
@@ -454,9 +455,11 @@ def resolve_show(show_pid: int) -> None:
         for pid, tot in others.items():
             round_points[pid] = tot
         outcome = "win"
+        min_players: list[int] = []
     else:
         round_points[show_pid] = SHOW_PENALTY
         min_other = min(others.values()) if others else show_total
+        min_players = [pid for pid, tot in others.items() if tot == min_other]
         for pid, tot in others.items():
             round_points[pid] = 0 if tot == min_other else tot
         outcome = "penalty"
@@ -475,6 +478,7 @@ def resolve_show(show_pid: int) -> None:
     last_round_summary = {
         "round_no": round_no,
         "joker_card": joker_card,
+        "joker_rank": joker_rank,
         "show_pid": show_pid,
         "show_total": show_total,
         "totals": totals,
@@ -482,6 +486,8 @@ def resolve_show(show_pid: int) -> None:
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "outcome": outcome,
+        "same_or_less_players": same_or_less_players,
+        "min_players": min_players,
         "newly_out": newly_out,
     }
     round_over = True
@@ -533,34 +539,42 @@ while running:
             continue
 
         is_turn = pid == turn_order[current_turn_idx]
-        phase = turn_phase.get(pid, "draw")
-        if action == "discard" and is_turn and phase == "discard":
+        phase = turn_phase.get(pid, "discard")
+        if action == "discard" and is_turn and phase == "discard" and not round_over:
             card = data.get("card")
             if isinstance(card, str) and card in hands.get(pid, []):
+                prev_top = discard_pile[-1] if discard_pile else None
+                prev_top_face = prev_top[:-1] if prev_top and prev_top not in ("ZB", "ZR") else prev_top
                 face = card[:-1] if len(card) > 1 else card
                 removed = [c for c in hands.get(pid, []) if (c[:-1] if len(c) > 1 else c) == face]
                 hands[pid] = [c for c in hands.get(pid, []) if (c[:-1] if len(c) > 1 else c) != face]
                 sort_hand(pid)
                 discard_pile.extend(removed)
                 send_hand(pid)
-                turn_phase[pid] = "draw"
-                next_turn()
+                # Exception: if open card is same rank, player may discard without picking.
+                if prev_top_face is not None and prev_top_face == face:
+                    turn_phase[pid] = "discard"
+                    next_turn()
+                else:
+                    turn_phase[pid] = "draw"
                 broadcast_state()
-        elif action == "draw_deck" and is_turn and phase == "draw":
+        elif action == "draw_deck" and is_turn and phase == "draw" and not round_over:
             if deck:
                 hands[pid].append(deck.pop())
                 sort_hand(pid)
                 send_hand(pid)
                 turn_phase[pid] = "discard"
+                next_turn()
                 broadcast_state()
-        elif action == "draw_discard" and is_turn and phase == "draw":
+        elif action == "draw_discard" and is_turn and phase == "draw" and not round_over:
             if discard_pile:
                 hands[pid].append(discard_pile.pop())
                 sort_hand(pid)
                 send_hand(pid)
                 turn_phase[pid] = "discard"
+                next_turn()
                 broadcast_state()
-        elif action == "show" and is_turn:
+        elif action == "show" and is_turn and (phase in ("discard", "draw")) and not round_over:
             resolve_show(pid)
 
     # --- Draw background ---
@@ -632,26 +646,36 @@ while running:
             screen.blit(txt, (x, y))
             x += txt.get_width() + 18
 
-        # Show per-hand totals at top-right for current round
-        totals_line = "  ".join([f"P{pid}:{hand_total(pid)}" for pid in turn_order])
-        screen.blit(FONT_XS.render(totals_line, True, (210, 220, 235)), (score_bar.x + 16, score_bar.y + 42))
-
         # Turn hint
         turn = turn_order[current_turn_idx] if turn_order else None
-        phase = turn_phase.get(turn, "draw") if turn is not None else "draw"
+        phase = turn_phase.get(turn, "discard") if turn is not None else "discard"
         hint = ""
         if not round_over and turn == HOST_ID:
-            hint = "Click deck/discard to draw" if phase == "draw" else "Double-click a card to discard"
+            hint = "Double-click a card to discard (first)" if phase == "discard" else "Click deck/discard to pick (after discard)"
         elif round_over:
             hint = "Round over. Click Next Round (host) to continue."
         if hint:
             screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, 92))
 
-        # Show button (only when host turn and <= show limit)
-        can_show = (not round_over) and (turn == HOST_ID) and (hand_total(HOST_ID) <= SHOW_LIMIT)
+        # Show is allowed only before drawing in the current turn.
+        can_show = (not round_over) and (turn == HOST_ID) and (phase in ("discard", "draw")) and (hand_total(HOST_ID) <= SHOW_LIMIT)
         draw_button(btn_show, enabled=can_show)
         if round_over:
             draw_button(btn_next_round, enabled=True)
+        if round_over and last_round_summary:
+            show_pid = last_round_summary.get("show_pid")
+            show_total = last_round_summary.get("show_total")
+            outcome = last_round_summary.get("outcome")
+            if outcome == "win":
+                msg = f"Player {show_pid} SHOWED {show_total} and WON (0 pts)."
+            else:
+                same_or_less = last_round_summary.get("same_or_less_players", [])
+                msg = f"Player {show_pid} SHOWED {show_total} and got PENALTY (+{SHOW_PENALTY}). Same/less: {same_or_less}"
+            banner = pygame.Rect(180, 92, 780, 34)
+            pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
+            pygame.draw.rect(screen, (40, 35, 20), banner, border_radius=10)
+            pygame.draw.rect(screen, (130, 110, 70), banner, width=2, border_radius=10)
+            screen.blit(FONT_SM.render(msg, True, (245, 235, 200)), (banner.x + 10, banner.y + 8))
 
     elif state == STATE_RESULTS:
         screen.blit(FONT.render("Results", True, (230, 235, 245)), (panel_left.x + 20, 86))
@@ -742,26 +766,28 @@ while running:
 
             elif state == STATE_PLAYING:
                 turn = turn_order[current_turn_idx] if turn_order else None
-                phase = turn_phase.get(HOST_ID, "draw")
+                phase = turn_phase.get(HOST_ID, "discard")
 
                 if btn_next_round.rect.collidepoint(pos) and round_over:
                     # Continue match if possible
                     active = [pid for pid in turn_order if pid not in eliminated]
                     if len(active) >= 1:
                         start_round()
-                elif btn_show.rect.collidepoint(pos) and (not round_over) and (turn == HOST_ID) and (hand_total(HOST_ID) <= SHOW_LIMIT):
+                elif btn_show.rect.collidepoint(pos) and (not round_over) and (turn == HOST_ID) and (phase in ("discard", "draw")) and (hand_total(HOST_ID) <= SHOW_LIMIT):
                     resolve_show(HOST_ID)
                 elif (not round_over) and turn == HOST_ID and phase == "draw" and draw_pile_rect.collidepoint(pos):
                     if deck:
                         hands[HOST_ID].append(deck.pop())
                         sort_hand(HOST_ID)
                         turn_phase[HOST_ID] = "discard"
+                        next_turn()
                         broadcast_state()
                 elif (not round_over) and turn == HOST_ID and phase == "draw" and discard_rect.collidepoint(pos):
                     if discard_pile:
                         hands[HOST_ID].append(discard_pile.pop())
                         sort_hand(HOST_ID)
                         turn_phase[HOST_ID] = "discard"
+                        next_turn()
                         broadcast_state()
                 elif (not round_over) and turn == HOST_ID and phase == "discard":
                     # Double-click a hand card to discard it.
@@ -787,12 +813,18 @@ while running:
                         last_click_ms = now
                         if is_double and clicked in hands.get(HOST_ID, []):
                             face = clicked[:-1] if len(clicked) > 1 else clicked
+                            prev_top = discard_pile[-1] if discard_pile else None
+                            prev_top_face = prev_top[:-1] if prev_top and prev_top not in ("ZB", "ZR") else prev_top
                             removed = [c for c in hands.get(HOST_ID, []) if (c[:-1] if len(c) > 1 else c) == face]
                             hands[HOST_ID] = [c for c in hands.get(HOST_ID, []) if (c[:-1] if len(c) > 1 else c) != face]
                             sort_hand(HOST_ID)
                             discard_pile.extend(removed)
-                            turn_phase[HOST_ID] = "draw"
-                            next_turn()
+                            # Exception: if open card is same rank, you may discard without picking.
+                            if prev_top_face is not None and prev_top_face == face:
+                                turn_phase[HOST_ID] = "discard"
+                                next_turn()
+                            else:
+                                turn_phase[HOST_ID] = "draw"
                             broadcast_state()
 
             elif state == STATE_RESULTS:

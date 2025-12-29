@@ -209,7 +209,7 @@ scores_total: dict = {}
 eliminated: list[int] = []
 round_no: int = 0
 round_over: bool = False
-hand_totals: dict = {}
+round_summary: dict | None = None
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -324,6 +324,7 @@ while running:
                 show_limit = int(rules.get("show_limit", show_limit) or show_limit)
             except Exception:
                 show_limit = show_limit
+            round_summary = None
             continue
 
         if action == "hand":
@@ -336,20 +337,20 @@ while running:
             discard_top = st.get("discard_top")
             current_turn = st.get("turn")
             deck_count = int(st.get("deck_count", 0) or 0)
-            turn_phase = str(st.get("turn_phase", "draw") or "draw")
+            turn_phase = str(st.get("turn_phase", "discard") or "discard")
             joker_card = st.get("joker_card")
             joker_rank = st.get("joker_rank")
             scores_total = st.get("scores_total", {}) or {}
             eliminated = list(st.get("eliminated", []) or [])
             round_no = int(st.get("round_no", 0) or 0)
             round_over = bool(st.get("round_over", False))
-            hand_totals = st.get("hand_totals", {}) or {}
             continue
 
         if action == "round_end":
             # Round ended summary; state will also reflect round_over.
             state = STATE_PLAYING
             round_over = True
+            round_summary = data.get("summary")
             continue
 
         if action == "end":
@@ -367,8 +368,10 @@ while running:
     sub = FONT_SM.render("Player • Connect • Least Count", True, (200, 210, 225))
     screen.blit(sub, (44, 52))
 
-    draw_panel(panel_left, "Control")
-    draw_panel(panel_right, "Table")
+    # Panels are used for setup screens only (game screen is full table).
+    if state != STATE_PLAYING:
+        draw_panel(panel_left, "Control")
+        draw_panel(panel_right, "Table")
 
     # UI
     if state == STATE_MENU:
@@ -415,22 +418,37 @@ while running:
             screen.blit(txt, (x, y))
             x += txt.get_width() + 14
 
-        totals_line = "  ".join([f"P{pid}:{hand_totals.get(str(pid), hand_totals.get(pid, '?'))}" for pid in sorted(hand_totals.keys(), key=lambda k: int(k) if str(k).isdigit() else 999)])
-        if totals_line:
-            screen.blit(FONT_XS.render(totals_line, True, (210, 220, 235)), (score_bar.x + 16, score_bar.y + 42))
+        # Current-round totals are hidden during play; shown only in round-end summary.
 
         # Turn hint
         hint = ""
         if round_over:
             hint = "Round over. Waiting for host to start next round."
         elif current_turn == player_id:
-            hint = "Click deck/discard to draw" if turn_phase == "draw" else "Double-click a card to discard"
+            hint = "Double-click a card to discard (first)" if turn_phase == "discard" else "Click deck/discard to pick (after discard)"
         if hint:
             screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, 92))
 
-        can_show = (not round_over) and (current_turn == player_id) and (hand_total(hand) <= show_limit)
+        # Show allowed only before drawing in the current turn.
+        can_show = (not round_over) and (current_turn == player_id) and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit)
         draw_button(btn_show, enabled=can_show)
         draw_button(btn_disconnect, enabled=True)
+
+        # Round outcome banner
+        if round_over and round_summary:
+            show_pid = round_summary.get("show_pid")
+            show_total = round_summary.get("show_total")
+            outcome = round_summary.get("outcome")
+            if outcome == "win":
+                msg = f"Player {show_pid} SHOWED {show_total} and WON (0 pts)."
+            else:
+                same_or_less = round_summary.get("same_or_less_players", [])
+                msg = f"Player {show_pid} SHOWED {show_total} and got PENALTY (+40). Same/less: {same_or_less}"
+            banner = pygame.Rect(180, 92, 780, 34)
+            pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
+            pygame.draw.rect(screen, (40, 35, 20), banner, border_radius=10)
+            pygame.draw.rect(screen, (130, 110, 70), banner, width=2, border_radius=10)
+            screen.blit(FONT_SM.render(msg, True, (245, 235, 200)), (banner.x + 10, banner.y + 8))
 
         # draw pile
         pygame.draw.rect(screen, (0, 0, 0), draw_pile_rect.move(0, 4), border_radius=14)
@@ -458,9 +476,9 @@ while running:
         # hand (sorted + overlapping)
         hand = sort_hand(hand)
         n = len(hand)
-        available = panel_right.width - 44 - CARD_W
+        available = 940 - 60 - CARD_W
         step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
-        hx = panel_right.x + 22
+        hx = 30
         for i, card in enumerate(hand):
             rect = pygame.Rect(hx + i * step, HAND_Y, CARD_W, CARD_H)
             img = pygame.transform.smoothscale(load_card_image(card), (CARD_W, CARD_H))
@@ -504,19 +522,19 @@ while running:
                     disconnect()
 
             if state == STATE_PLAYING:
-                if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (hand_total(hand) <= show_limit):
+                if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit):
                     send_action("show")
-                elif current_turn == player_id and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
+                elif current_turn == player_id and (not round_over) and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
                     send_action("draw_deck")
-                elif current_turn == player_id and turn_phase == "draw" and discard_rect.collidepoint(pos):
+                elif current_turn == player_id and (not round_over) and turn_phase == "draw" and discard_rect.collidepoint(pos):
                     send_action("draw_discard")
-                elif current_turn == player_id and turn_phase == "discard":
+                elif current_turn == player_id and (not round_over) and turn_phase == "discard":
                     # Double-click a hand card to discard it.
                     hand = sort_hand(hand)
                     n = len(hand)
-                    available = panel_right.width - 44 - CARD_W
+                    available = 940 - 60 - CARD_W
                     step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
-                    hx = panel_right.x + 22
+                    hx = 30
                     clicked: str | None = None
                     for i in range(n - 1, -1, -1):
                         card = hand[i]
