@@ -267,6 +267,9 @@ pick_discard_card: str | None = None
 round_history: list[dict] = []
 player_names: dict = {}
 scroll_rows_from_bottom = 0  # for scoreboard scrolling (round rows only)
+dealer_pid: int | None = None
+match_over: bool = False
+match_winner: int | None = None
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -414,6 +417,9 @@ while running:
             players_in_round = list(st.get("players", []) or [])
             round_history = list(st.get("round_history", []) or [])
             player_names = st.get("player_names", {}) or {}
+            dealer_pid = st.get("dealer_pid")
+            match_over = bool(st.get("match_over", False))
+            match_winner = st.get("match_winner")
             continue
 
         if action == "round_end":
@@ -427,6 +433,8 @@ while running:
             winner = data.get("winner")
             print("Match over! Winner:", winner, "Final totals:", data.get("scores_total"))
             round_over = True
+            match_over = True
+            match_winner = winner
             continue
 
         if action == "end":
@@ -578,7 +586,14 @@ while running:
         draw_button(btn_disconnect_game, enabled=True)
 
         # Round outcome banner
-        if round_over and round_summary:
+        if match_over and match_winner is not None:
+            msg = f"GAME OVER — Winner: {player_names.get(match_winner, player_names.get(str(match_winner), f'P{match_winner}'))}"
+            banner = pygame.Rect(180, score_bar.bottom + 6, BASE_SIZE[0] - 200, 34)
+            pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
+            pygame.draw.rect(screen, (60, 40, 15), banner, border_radius=10)
+            pygame.draw.rect(screen, (255, 235, 120), banner, width=2, border_radius=10)
+            screen.blit(FONT_SM.render(msg, True, (245, 235, 200)), (banner.x + 10, banner.y + 8))
+        elif round_over and round_summary:
             show_pid = round_summary.get("show_pid")
             show_total = round_summary.get("show_total")
             outcome = round_summary.get("outcome")
@@ -587,7 +602,7 @@ while running:
             else:
                 same_or_less = round_summary.get("same_or_less_players", [])
                 msg = f"Player {show_pid} SHOWED {show_total} and got PENALTY (+40). Same/less: {same_or_less}"
-            banner = pygame.Rect(180, 92, 780, 34)
+            banner = pygame.Rect(180, score_bar.bottom + 6, BASE_SIZE[0] - 200, 34)
             pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
             pygame.draw.rect(screen, (40, 35, 20), banner, border_radius=10)
             pygame.draw.rect(screen, (130, 110, 70), banner, width=2, border_radius=10)
