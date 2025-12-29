@@ -360,6 +360,12 @@ def send_action(action: str, card: str | None = None) -> None:
         pass
 
 
+def exit_match() -> None:
+    # Tell host we are exiting this match, then disconnect locally.
+    send_action("exit")
+    disconnect()
+
+
 running = True
 while running:
     # Apply server messages
@@ -431,7 +437,8 @@ while running:
 
         if action == "match_end":
             winner = data.get("winner")
-            print("Match over! Winner:", winner, "Final totals:", data.get("scores_total"))
+            reason = data.get("reason")
+            print("Match over! Winner:", winner, "Reason:", reason, "Final totals:", data.get("scores_total"))
             round_over = True
             match_over = True
             match_winner = winner
@@ -742,7 +749,7 @@ while running:
 
             if state == STATE_PLAYING:
                 if btn_disconnect_game.rect.collidepoint(pos):
-                    disconnect()
+                    exit_match()
                 if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (turn_phase == "discard") and show_enabled and (hand_total(hand) <= show_limit):
                     send_action("show")
                 elif current_turn == player_id and (not round_over) and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
