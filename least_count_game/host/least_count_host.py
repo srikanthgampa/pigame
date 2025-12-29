@@ -201,7 +201,10 @@ eliminated: set[int] = set()
 round_over = False
 last_round_summary: dict | None = None
 show_available: dict[int, bool] = {}  # only true at start of the player's turn (before any action)
-reserved_discard: dict[int, dict] = {}  # pid -> {"idx": int, "card": str}
+# For "discard first, but still take the previously-open discard card":
+# we remember the discard-top that was open at the *start* of the player's turn.
+turn_open_discard: dict[int, dict] = {}  # pid -> {"idx": int, "card": str} or {}
+round_history: list[dict] = []  # list of {"round_no": int, "round_points": {pid:int}, "show_pid": int, "outcome": str}
 
 
 STATE_MENU = "menu"
@@ -302,14 +305,20 @@ def send_hand(pid: int) -> None:
 def broadcast_state() -> None:
     current_pid = turn_order[current_turn_idx] if turn_order else None
     hand_counts = {pid: len(hands.get(pid, [])) for pid in turn_order}
+    pick_discard_card = None
+    if current_pid is not None:
+        pick_discard_card = turn_open_discard.get(current_pid, {}).get("card")
     state_msg = {
         "discard_top": discard_pile[-1] if discard_pile else None,
         "turn": current_pid,
         "turn_phase": turn_phase.get(current_pid, "discard") if current_pid is not None else "discard",
         "show_enabled": show_available.get(current_pid, False) if current_pid is not None else False,
+        "pick_discard_card": pick_discard_card,
         "deck_count": len(deck),
         "players": turn_order[:],
         "hand_counts": hand_counts,
+        "player_names": {pid: player_names.get(pid, f"Player {pid}") for pid in scores_total.keys()},
+        "round_history": round_history[-50:],
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "round_no": round_no,
@@ -331,6 +340,7 @@ def start_match() -> None:
     last_round_summary = None
     round_no = 0
     eliminated = set()
+    round_history.clear()
     scores_total = {HOST_ID: 0}
     for pid in connections.keys():
         scores_total[pid] = 0
@@ -338,11 +348,11 @@ def start_match() -> None:
 
 
 def start_round() -> None:
-    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, joker_rank, round_no, round_over, last_round_summary, show_available, reserved_discard
+    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, joker_rank, round_no, round_over, last_round_summary, show_available, turn_open_discard
     last_round_summary = None
     round_over = False
     round_no += 1
-    reserved_discard = {}
+    turn_open_discard = {}
 
     deck = build_deck()
     discard_pile = []
@@ -360,6 +370,8 @@ def start_round() -> None:
     show_available = {pid: False for pid in turn_order}
     if turn_order:
         show_available[turn_order[0]] = True
+        if discard_pile:
+            turn_open_discard[turn_order[0]] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
 
     # Pick designated joker card for this round (actual card, 0 points for round).
     joker_card = deck.pop() if deck else None
@@ -443,7 +455,11 @@ def next_turn() -> None:
         pid = turn_order[current_turn_idx]
         # show is only available at the start of the turn
         show_available[pid] = True
-        reserved_discard.pop(pid, None)
+        # remember which discard card was open at the start of this player's turn
+        if discard_pile:
+            turn_open_discard[pid] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
+        else:
+            turn_open_discard.pop(pid, None)
 
 def end_game():
     global game_started, last_results, turn_phase
@@ -525,6 +541,14 @@ def resolve_show(show_pid: int) -> None:
         "min_players": min_players,
         "newly_out": newly_out,
     }
+    round_history.append(
+        {
+            "round_no": round_no,
+            "round_points": round_points,
+            "show_pid": show_pid,
+            "outcome": outcome,
+        }
+    )
     round_over = True
 
     # Tell clients round ended
@@ -575,13 +599,7 @@ while running:
 
         is_turn = pid == turn_order[current_turn_idx]
         phase = turn_phase.get(pid, "discard")
-        if action == "reserve_discard" and is_turn and phase == "discard" and not round_over:
-            # Reserve the currently-open discard card so you can still take it after discarding
-            # (otherwise your discard becomes the new open card).
-            if discard_pile:
-                reserved_discard[pid] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
-                broadcast_state()
-        elif action == "discard" and is_turn and phase == "discard" and not round_over:
+        if action == "discard" and is_turn and phase == "discard" and not round_over:
             card = data.get("card")
             if isinstance(card, str) and card in hands.get(pid, []):
                 prev_top = discard_pile[-1] if discard_pile else None
@@ -598,26 +616,7 @@ while running:
                     turn_phase[pid] = "discard"
                     next_turn()
                 else:
-                    # If the player reserved the previously-open discard, deliver it now and end turn.
-                    res = reserved_discard.pop(pid, None)
-                    if res and isinstance(res.get("idx"), int) and isinstance(res.get("card"), str):
-                        idx = res["idx"]
-                        card_to_take = res["card"]
-                        if 0 <= idx < len(discard_pile) and discard_pile[idx] == card_to_take:
-                            discard_pile.pop(idx)
-                        else:
-                            # Fallback: remove one matching instance from the pile (from top-down)
-                            for j in range(len(discard_pile) - 1, -1, -1):
-                                if discard_pile[j] == card_to_take:
-                                    discard_pile.pop(j)
-                                    break
-                        hands[pid].append(card_to_take)
-                        sort_hand(pid)
-                        send_hand(pid)
-                        turn_phase[pid] = "discard"
-                        next_turn()
-                    else:
-                        turn_phase[pid] = "draw"
+                    turn_phase[pid] = "draw"
                 broadcast_state()
         elif action == "draw_deck" and is_turn and phase == "draw" and not round_over:
             if deck:
@@ -630,7 +629,23 @@ while running:
                 broadcast_state()
         elif action == "draw_discard" and is_turn and phase == "draw" and not round_over:
             if discard_pile:
-                hands[pid].append(discard_pile.pop())
+                # Take the discard card that was open at the start of this turn (not the card you just discarded).
+                ref = turn_open_discard.get(pid, {})
+                card_to_take = None
+                idx = ref.get("idx")
+                ref_card = ref.get("card")
+                if isinstance(idx, int) and isinstance(ref_card, str) and 0 <= idx < len(discard_pile) and discard_pile[idx] == ref_card:
+                    card_to_take = discard_pile.pop(idx)
+                else:
+                    # Fallback: remove one matching instance from top-down, else take top.
+                    if isinstance(ref_card, str):
+                        for j in range(len(discard_pile) - 1, -1, -1):
+                            if discard_pile[j] == ref_card:
+                                card_to_take = discard_pile.pop(j)
+                                break
+                    if card_to_take is None:
+                        card_to_take = discard_pile.pop()
+                hands[pid].append(card_to_take)
                 sort_hand(pid)
                 send_hand(pid)
                 turn_phase[pid] = "discard"
@@ -915,11 +930,6 @@ while running:
                         start_round()
                 elif btn_show.rect.collidepoint(pos) and (not round_over) and (turn == HOST_ID) and (phase == "discard") and show_available.get(HOST_ID, False) and (hand_total(HOST_ID) <= SHOW_LIMIT):
                     resolve_show(HOST_ID)
-                elif (not round_over) and turn == HOST_ID and phase == "discard" and discard_rect.collidepoint(pos):
-                    # Reserve open discard so you can take it after you discard.
-                    if discard_pile:
-                        reserved_discard[HOST_ID] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
-                        broadcast_state()
                 elif (not round_over) and turn == HOST_ID and phase == "draw" and draw_pile_rect.collidepoint(pos):
                     if deck:
                         hands[HOST_ID].append(deck.pop())
@@ -972,24 +982,7 @@ while running:
                                 turn_phase[HOST_ID] = "discard"
                                 next_turn()
                             else:
-                                # If reserved, take the previously-open discard now and end turn.
-                                res = reserved_discard.pop(HOST_ID, None)
-                                if res and isinstance(res.get("idx"), int) and isinstance(res.get("card"), str):
-                                    idx = res["idx"]
-                                    card_to_take = res["card"]
-                                    if 0 <= idx < len(discard_pile) and discard_pile[idx] == card_to_take:
-                                        discard_pile.pop(idx)
-                                    else:
-                                        for j in range(len(discard_pile) - 1, -1, -1):
-                                            if discard_pile[j] == card_to_take:
-                                                discard_pile.pop(j)
-                                                break
-                                    hands[HOST_ID].append(card_to_take)
-                                    sort_hand(HOST_ID)
-                                    turn_phase[HOST_ID] = "discard"
-                                    next_turn()
-                                else:
-                                    turn_phase[HOST_ID] = "draw"
+                                turn_phase[HOST_ID] = "draw"
                             broadcast_state()
 
             elif state == STATE_RESULTS:
