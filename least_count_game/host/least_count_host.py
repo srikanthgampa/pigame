@@ -223,6 +223,7 @@ scroll_rows_from_bottom = 0
 # Match end
 match_over = False
 match_winner: int | None = None
+match_end_reason: str | None = None  # "points" | "player_exit" | "host_closed"
 dealer_pid: int = HOST_ID
 player_order: list[int] = [HOST_ID]
 
@@ -290,6 +291,8 @@ draw_pile_rect = pygame.Rect(BASE_SIZE[0] // 2 - 190, BASE_SIZE[1] // 2 - 120, _
 discard_rect = pygame.Rect(BASE_SIZE[0] // 2 + 30, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 btn_show = Button(pygame.Rect(BASE_SIZE[0] - 170, 128, 120, 36), "SHOW")
 btn_next_round = Button(pygame.Rect(BASE_SIZE[0] - 220, BASE_SIZE[1] - 80, 180, 52), "Next Round")
+btn_back_lobby = Button(pygame.Rect(BASE_SIZE[0] - 260, BASE_SIZE[1] - 80, 220, 52), "Back to Lobby")
+btn_exit_host = Button(pygame.Rect(BASE_SIZE[0] - 150, 20, 130, 34), "Close Game")
 
 CARD_W, CARD_H = 92, 138
 HAND_Y = BASE_SIZE[1] - 190
@@ -404,6 +407,7 @@ def broadcast_state() -> None:
         "round_history": round_history[-50:],
         "match_over": match_over,
         "match_winner": match_winner,
+        "match_end_reason": match_end_reason,
         "dealer_pid": dealer_pid,
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
@@ -421,7 +425,7 @@ def broadcast_state() -> None:
 
 
 def start_match() -> None:
-    global game_started, scores_total, eliminated, round_no, last_round_summary, match_over, match_winner
+    global game_started, scores_total, eliminated, round_no, last_round_summary, match_over, match_winner, match_end_reason
     game_started = True
     last_round_summary = None
     round_no = 0
@@ -429,6 +433,7 @@ def start_match() -> None:
     round_history.clear()
     match_over = False
     match_winner = None
+    match_end_reason = None
     recompute_player_order()
     scores_total = {HOST_ID: 0}
     for pid in connections.keys():
@@ -589,6 +594,50 @@ def end_game():
     turn_phase = {}
     print("Game Over! Scores:", scores, "Winner:", winner)
 
+
+def reset_to_lobby(message: str | None = None) -> None:
+    global game_started, match_over, match_winner, match_end_reason, round_over, last_round_summary, turn_order, current_turn_idx, turn_phase, turn_open_discard
+    game_started = False
+    match_over = False
+    match_winner = None
+    match_end_reason = None
+    round_over = False
+    last_round_summary = None
+    turn_order = []
+    current_turn_idx = 0
+    turn_phase = {}
+    turn_open_discard = {}
+    if message:
+        global status_line
+        status_line = message
+    sync_player_order()
+    state_to_lobby = globals().get("STATE_LOBBY")
+    globals()["state"] = state_to_lobby
+    broadcast_lobby()
+
+
+def close_game_by_host() -> None:
+    """
+    Host closes the game: regardless of players remaining, end match with reason and disconnect everyone.
+    """
+    global game_started, match_over, match_winner, match_end_reason
+    match_over = True
+    match_winner = None
+    match_end_reason = "host_closed"
+    game_started = False
+    for pid, conn in list(connections.items()):
+        try:
+            send_json(conn, {"action": "match_end", "winner": None, "reason": match_end_reason, "scores_total": scores_total})
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    connections.clear()
+    sync_player_order()
+    reset_to_lobby("Host closed the game.")
+
 def resolve_show(show_pid: int) -> None:
     """
     Implements Least Count show rule:
@@ -665,15 +714,16 @@ def resolve_show(show_pid: int) -> None:
     round_over = True
 
     # Match end: if only one active player remains, declare winner and end match.
-    global match_over, match_winner, game_started
+    global match_over, match_winner, game_started, match_end_reason
     remaining = active_players()
     if len(remaining) == 1:
         match_over = True
         match_winner = remaining[0]
+        match_end_reason = "points"
         game_started = False
         for pid, conn in list(connections.items()):
             try:
-                send_json(conn, {"action": "match_end", "winner": match_winner, "scores_total": scores_total})
+                send_json(conn, {"action": "match_end", "winner": match_winner, "reason": match_end_reason, "scores_total": scores_total})
             except Exception:
                 pass
         broadcast_state()
@@ -707,9 +757,46 @@ while running:
                     conn.close()
                 except Exception:
                     pass
-            if not game_started:
+            # If this happens during a game, treat as player exiting the match.
+            if game_started and pid in scores_total:
+                eliminated.add(pid)
+                # Remove from current turn order if present
+                if pid in turn_order:
+                    idx = turn_order.index(pid)
+                    turn_order = [p for p in turn_order if p != pid]
+                    # If they were before current index, adjust
+                    if idx <= current_turn_idx and current_turn_idx > 0:
+                        current_turn_idx -= 1
+                    if current_turn_idx >= len(turn_order):
+                        current_turn_idx = 0
+                # Determine if match ends due to exit
+                remaining = active_players()
+                if len(remaining) == 1:
+                    global match_over, match_winner, match_end_reason
+                    match_over = True
+                    match_winner = remaining[0]
+                    match_end_reason = "player_exit"
+                    game_started = False
+                    for opid, oconn in list(connections.items()):
+                        try:
+                            send_json(oconn, {"action": "match_end", "winner": match_winner, "reason": match_end_reason, "scores_total": scores_total})
+                        except Exception:
+                            pass
+                broadcast_state()
+            else:
                 recompute_player_order()
                 broadcast_lobby()
+            continue
+
+        if action == "exit":
+            # Explicit exit from a player; close socket and handle like disconnect.
+            conn = connections.pop(pid, None)
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            incoming.put((pid, {"action": "disconnect"}))
             continue
 
         if action == "hello":
@@ -935,8 +1022,12 @@ while running:
         # Show is allowed only at the start of your turn (before discard/pick), and only when <= show limit.
         can_show = (not round_over) and (turn == HOST_ID) and (phase == "discard") and show_available.get(HOST_ID, False) and (hand_total(HOST_ID) <= SHOW_LIMIT)
         draw_button(btn_show, enabled=can_show)
-        if round_over:
+        # Control buttons: next round only when round_over and match not over.
+        if match_over:
+            draw_button(btn_back_lobby, enabled=True)
+        elif round_over:
             draw_button(btn_next_round, enabled=True)
+        draw_button(btn_exit_host, enabled=True)
         if match_over and match_winner is not None:
             msg = f"GAME OVER — Winner: {player_names.get(match_winner, f'Player {match_winner}')}"
             banner = pygame.Rect(180, score_bar.bottom + 6, BASE_SIZE[0] - 200, 34)
@@ -1136,7 +1227,13 @@ while running:
                 turn = turn_order[current_turn_idx] if turn_order else None
                 phase = turn_phase.get(HOST_ID, "discard")
 
-                if btn_next_round.rect.collidepoint(pos) and round_over:
+                if btn_exit_host.rect.collidepoint(pos):
+                    close_game_by_host()
+                    break
+                if btn_back_lobby.rect.collidepoint(pos) and match_over:
+                    reset_to_lobby("Back to lobby.")
+                    break
+                if btn_next_round.rect.collidepoint(pos) and round_over and (not match_over):
                     # Continue match if possible
                     active = [pid for pid in turn_order if pid not in eliminated]
                     if len(active) >= 1:
