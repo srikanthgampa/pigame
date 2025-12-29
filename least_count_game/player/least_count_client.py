@@ -15,13 +15,45 @@ BASE_DIR = Path(__file__).resolve().parents[1]  # /least_count_game
 ASSETS_DIR = BASE_DIR / "assets" / "cards"
 
 pygame.init()
-BASE_SIZE = (1280, 720)  # virtual canvas; we scale to window size
+# Pi Zero W performance: keep a smaller virtual canvas and scale up.
+BASE_SIZE = (960, 540)  # virtual canvas; we scale to window size
 WINDOWED_SIZE = BASE_SIZE
 _is_fullscreen = False
 window = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE)
 screen = pygame.Surface(BASE_SIZE)
 pygame.display.set_caption("Raspberry Pi Gaming Hub (Player)")
 clock = pygame.time.Clock()
+
+USE_SMOOTH_SCALE = False
+
+
+_sprite_cache: dict[tuple[str, int, int, int], pygame.Surface] = {}
+_halo_cache: dict[tuple[int, int], pygame.Surface] = {}
+
+
+def get_sprite(card_name: str, size: tuple[int, int], angle: int = 0) -> pygame.Surface:
+    w, h = size
+    key = (card_name, w, h, angle)
+    cached = _sprite_cache.get(key)
+    if cached is not None:
+        return cached
+    base = load_card_image(card_name)
+    scaled = pygame.transform.smoothscale(base, (w, h)) if USE_SMOOTH_SCALE else pygame.transform.scale(base, (w, h))
+    if angle:
+        scaled = pygame.transform.rotate(scaled, angle)
+    _sprite_cache[key] = scaled
+    return scaled
+
+
+def get_halo(size: tuple[int, int]) -> pygame.Surface:
+    key = (size[0], size[1])
+    cached = _halo_cache.get(key)
+    if cached is not None:
+        return cached
+    halo = pygame.Surface(size, pygame.SRCALPHA)
+    pygame.draw.ellipse(halo, (255, 235, 120, 55), halo.get_rect())
+    _halo_cache[key] = halo
+    return halo
 
 
 def to_canvas(pos: tuple[int, int]) -> tuple[int, int]:
@@ -246,14 +278,14 @@ btn_connect = Button(pygame.Rect(60, 420, 320, 56), "Connect")
 btn_disconnect = Button(pygame.Rect(60, 520, 320, 56), "Disconnect")
 btn_back = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
 
-_pile_w, _pile_h = 160, 224
+_pile_w, _pile_h = 140, 196
 draw_pile_rect = pygame.Rect(BASE_SIZE[0] // 2 - 190, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 discard_rect = pygame.Rect(BASE_SIZE[0] // 2 + 30, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
 btn_show = Button(pygame.Rect(BASE_SIZE[0] - 170, 128, 120, 36), "SHOW")
 btn_disconnect_game = Button(pygame.Rect(BASE_SIZE[0] - 110, 20, 90, 32), "Exit")
 
-CARD_W, CARD_H = 92, 138
+CARD_W, CARD_H = 78, 117
 HAND_Y = BASE_SIZE[1] - 190
 
 ip_input = TextInput(pygame.Rect(60, 250, 320, 50), value=host_ip)
@@ -429,7 +461,7 @@ while running:
     elif state == STATE_LOBBY:
         screen.blit(FONT.render("Lobby", True, (230, 235, 245)), (panel_left.x + 20, 86))
         y = panel_left.y + 140
-        chip = pygame.transform.smoothscale(load_card_image("BlueChip"), (34, 34))
+        chip = get_sprite("BlueChip", (34, 34))
         for p in players_list:
             screen.blit(chip, (panel_left.x + 20, y))
             name = str(p.get("name") or f"Player {p.get('id')}")
@@ -562,10 +594,9 @@ while running:
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
         # Joker peeking under the deck (designated joker for the round)
         peek_name = joker_card or "ZB"
-        peek_joker = pygame.transform.smoothscale(load_card_image(peek_name), (92, 130))
-        peek_joker = pygame.transform.rotate(peek_joker, -18)
+        peek_joker = get_sprite(peek_name, (78, 110), angle=-18)
         screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
-        back = pygame.transform.smoothscale(load_card_image("CardBack"), (120, 170))
+        back = get_sprite("CardBack", (110, 156))
         screen.blit(back, (draw_pile_rect.x + 15, draw_pile_rect.y + 18))
 
         # discard pile
@@ -573,10 +604,10 @@ while running:
         pygame.draw.rect(screen, (35, 40, 52), discard_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), discard_rect, width=2, border_radius=14)
         if discard_top:
-            img = pygame.transform.smoothscale(load_card_image(discard_top), (120, 170))
+            img = get_sprite(discard_top, (110, 156))
             screen.blit(img, (discard_rect.x + 15, discard_rect.y + 18))
         else:
-            blank = pygame.transform.smoothscale(load_card_image("BlankCard"), (120, 170))
+            blank = get_sprite("BlankCard", (110, 156))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
         # hand (sorted + overlapping)
@@ -587,7 +618,7 @@ while running:
         hx = 30
         for i, card in enumerate(hand):
             rect = pygame.Rect(hx + i * step, HAND_Y, CARD_W, CARD_H)
-            img = pygame.transform.smoothscale(load_card_image(card), (CARD_W, CARD_H))
+            img = get_sprite(card, (CARD_W, CARD_H))
             screen.blit(img, rect.topleft)
             pygame.draw.rect(screen, (10, 10, 10), rect, width=2, border_radius=8)
 
@@ -595,15 +626,14 @@ while running:
         def _draw_seat(pid: int, rect: pygame.Rect, active_pid: int | None) -> None:
             is_active = (active_pid == pid) and (not round_over)
             if is_active:
-                halo = pygame.Surface(rect.inflate(90, 50).size, pygame.SRCALPHA)
-                pygame.draw.ellipse(halo, (255, 235, 120, 55), halo.get_rect())
+                halo = get_halo(rect.inflate(90, 50).size)
                 screen.blit(halo, halo.get_rect(center=rect.center))
                 pygame.draw.rect(screen, (255, 235, 120), rect.inflate(16, 16), width=4, border_radius=14)
             pygame.draw.rect(screen, (0, 0, 0), rect.move(0, 3), border_radius=12)
             pygame.draw.rect(screen, (25, 28, 35), rect, border_radius=12)
             pygame.draw.rect(screen, (90, 100, 120), rect, width=2, border_radius=12)
 
-            back_small = pygame.transform.smoothscale(load_card_image("CardBack"), (48, 68))
+            back_small = get_sprite("CardBack", (42, 60))
             # host sends int keys; be tolerant
             count = hand_counts.get(pid, hand_counts.get(str(pid), 0))
             stacks = min(int(count or 0), 5)
@@ -647,9 +677,9 @@ while running:
         draw_button(btn_disconnect, enabled=True)
         draw_button(btn_back, enabled=True)
 
-    window.blit(pygame.transform.smoothscale(screen, window.get_size()), (0, 0))
+    window.blit(pygame.transform.scale(screen, window.get_size()), (0, 0))
     pygame.display.flip()
-    clock.tick(60)
+    clock.tick(30)
 
     # Events
     for event in pygame.event.get():
