@@ -772,7 +772,6 @@ while running:
                 # Determine if match ends due to exit
                 remaining = active_players()
                 if len(remaining) == 1:
-                    global match_over, match_winner, match_end_reason
                     match_over = True
                     match_winner = remaining[0]
                     match_end_reason = "player_exit"
