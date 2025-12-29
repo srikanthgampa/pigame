@@ -14,7 +14,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]  # /least_count_game
 ASSETS_DIR = BASE_DIR / "assets" / "cards"
 
 pygame.init()
-screen = pygame.display.set_mode((980, 620))
+WINDOWED_SIZE = (980, 620)
+_is_fullscreen = False
+screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
 pygame.display.set_caption("Raspberry Pi Gaming Hub (Player)")
 clock = pygame.time.Clock()
 
@@ -210,6 +212,8 @@ eliminated: list[int] = []
 round_no: int = 0
 round_over: bool = False
 round_summary: dict | None = None
+hand_counts: dict = {}
+players_in_round: list[int] = []
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -224,6 +228,7 @@ draw_pile_rect = pygame.Rect(600, 150, 150, 210)
 discard_rect = pygame.Rect(770, 150, 150, 210)
 btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
 btn_show = Button(pygame.Rect(820, 140, 120, 36), "SHOW")
+btn_disconnect_game = Button(pygame.Rect(890, 82, 80, 32), "Exit")
 
 CARD_W, CARD_H = 92, 138
 HAND_Y = 460
@@ -344,6 +349,8 @@ while running:
             eliminated = list(st.get("eliminated", []) or [])
             round_no = int(st.get("round_no", 0) or 0)
             round_over = bool(st.get("round_over", False))
+            hand_counts = st.get("hand_counts", {}) or {}
+            players_in_round = list(st.get("players", []) or [])
             continue
 
         if action == "round_end":
@@ -432,7 +439,7 @@ while running:
         # Show allowed only before drawing in the current turn.
         can_show = (not round_over) and (current_turn == player_id) and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit)
         draw_button(btn_show, enabled=can_show)
-        draw_button(btn_disconnect, enabled=True)
+        draw_button(btn_disconnect_game, enabled=True)
 
         # Round outcome banner
         if round_over and round_summary:
@@ -485,6 +492,37 @@ while running:
             screen.blit(img, rect.topleft)
             pygame.draw.rect(screen, (10, 10, 10), rect, width=2, border_radius=8)
 
+        # Live-table: other players' hands face down + spotlight active player
+        def _draw_seat(pid: int, rect: pygame.Rect, active_pid: int | None) -> None:
+            is_active = (active_pid == pid) and (not round_over)
+            if is_active:
+                pygame.draw.rect(screen, (255, 235, 120), rect.inflate(16, 16), width=4, border_radius=14)
+            pygame.draw.rect(screen, (0, 0, 0), rect.move(0, 3), border_radius=12)
+            pygame.draw.rect(screen, (25, 28, 35), rect, border_radius=12)
+            pygame.draw.rect(screen, (90, 100, 120), rect, width=2, border_radius=12)
+
+            back_small = pygame.transform.smoothscale(load_card_image("CardBack"), (48, 68))
+            # host sends int keys; be tolerant
+            count = hand_counts.get(pid, hand_counts.get(str(pid), 0))
+            stacks = min(int(count or 0), 5)
+            sx = rect.x + 10
+            sy = rect.y + 10
+            for i in range(stacks):
+                screen.blit(back_small, (sx + i * 6, sy + i * 2))
+            screen.blit(FONT_XS.render(f"P{pid} ({count})", True, (235, 240, 248)), (rect.x + 10, rect.bottom - 20))
+
+        active_pid = current_turn
+        # Local player seat bottom-left
+        if player_id is not None:
+            _draw_seat(player_id, pygame.Rect(30, 540, 140, 80), active_pid)
+        others = [pid for pid in players_in_round if pid != player_id]
+        if others:
+            total_w = 920
+            step = total_w // max(1, len(others))
+            for i, pid in enumerate(others):
+                seat = pygame.Rect(30 + i * step, 100, 140, 80)
+                _draw_seat(pid, seat, active_pid)
+
     elif state == STATE_RESULTS:
         screen.blit(FONT.render("Results", True, (230, 235, 245)), (panel_left.x + 20, 86))
         if last_results:
@@ -507,6 +545,20 @@ while running:
         if event.type == pygame.QUIT:
             running = False
 
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_F11:
+                _is_fullscreen = not _is_fullscreen
+                if _is_fullscreen:
+                    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN | pygame.SCALED)
+                else:
+                    screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+            elif event.key == pygame.K_ESCAPE and _is_fullscreen:
+                _is_fullscreen = False
+                screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+
+        if event.type == pygame.VIDEORESIZE and not _is_fullscreen:
+            screen = pygame.display.set_mode(event.size, pygame.RESIZABLE | pygame.SCALED)
+
         if state == STATE_MENU:
             ip_input.handle_event(event)
 
@@ -517,11 +569,13 @@ while running:
                 if btn_connect.rect.collidepoint(pos):
                     connect_to_host()
 
-            elif state in (STATE_CONNECTING, STATE_LOBBY, STATE_PLAYING, STATE_RESULTS):
+            elif state in (STATE_CONNECTING, STATE_LOBBY, STATE_RESULTS):
                 if btn_disconnect.rect.collidepoint(pos):
                     disconnect()
 
             if state == STATE_PLAYING:
+                if btn_disconnect_game.rect.collidepoint(pos):
+                    disconnect()
                 if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (turn_phase in ("discard", "draw")) and (hand_total(hand) <= show_limit):
                     send_action("show")
                 elif current_turn == player_id and (not round_over) and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
