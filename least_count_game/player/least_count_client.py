@@ -34,6 +34,35 @@ def load_card_image(card_name: str) -> pygame.Surface:
     return img
 
 
+def card_sort_key(card: str) -> tuple[int, int]:
+    if card in ("ZB", "ZR"):
+        rank = 0
+        suit = 0
+    else:
+        face = card[:-1]
+        suit_char = card[-1]
+        suit_order = {"S": 0, "C": 1, "D": 2, "H": 3}
+        suit = suit_order.get(suit_char, 9)
+        if face == "A":
+            rank = 1
+        elif face == "J":
+            rank = 11
+        elif face == "Q":
+            rank = 12
+        elif face == "K":
+            rank = 13
+        else:
+            try:
+                rank = int(face)
+            except Exception:
+                rank = 99
+    return (rank, suit)
+
+
+def sort_hand(cards: list[str]) -> list[str]:
+    return sorted(cards, key=card_sort_key)
+
+
 def send_json(sock: socket.socket, payload: dict) -> None:
     data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
     sock.sendall(data)
@@ -149,12 +178,9 @@ discard_top: str | None = None
 current_turn: int | None = None
 player_id: int | None = None
 deck_count: int = 0
+turn_phase: str = "draw"  # phase for the current turn player ("draw" or "discard")
 players_list: list[dict] = []
 last_results: dict | None = None
-
-dragging_card: str | None = None
-offset_x = 0
-offset_y = 0
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -167,14 +193,18 @@ btn_back = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
 
 draw_pile_rect = pygame.Rect(600, 150, 150, 210)
 discard_rect = pygame.Rect(770, 150, 150, 210)
-btn_draw = Button(pygame.Rect(600, 380, 150, 54), "Draw")
-btn_least = Button(pygame.Rect(770, 380, 150, 54), "Least Count")
+btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
 
 CARD_W, CARD_H = 92, 138
 HAND_Y = 460
 
 ip_input = TextInput(pygame.Rect(60, 250, 320, 50), value=host_ip)
 status_line = "Select Least Count, then connect to the host."
+
+# Double-click handling (discard action)
+DOUBLE_CLICK_MS = 350
+last_click_ms = 0
+last_click_card: str | None = None
 
 
 def connected() -> bool:
@@ -262,7 +292,7 @@ while running:
             continue
 
         if action == "hand":
-            hand = list(data.get("hand", []))
+            hand = sort_hand(list(data.get("hand", [])))
             continue
 
         if action == "update":
@@ -271,6 +301,7 @@ while running:
             discard_top = st.get("discard_top")
             current_turn = st.get("turn")
             deck_count = int(st.get("deck_count", 0) or 0)
+            turn_phase = str(st.get("turn_phase", "draw") or "draw")
             continue
 
         if action == "end":
@@ -325,7 +356,9 @@ while running:
             turn_text = f"Waiting for Player {current_turn}"
         screen.blit(FONT.render(turn_text, True, (255, 235, 120)), (panel_left.x + 20, 100))
         screen.blit(FONT_SM.render(f"Deck: {deck_count} cards", True, (210, 220, 235)), (panel_left.x + 20, 138))
-        draw_button(btn_draw, enabled=(current_turn == player_id and deck_count > 0))
+        if current_turn == player_id:
+            hint = "Click deck/discard to draw" if turn_phase == "draw" else "Double-click a card to discard"
+            screen.blit(FONT_SM.render(hint, True, (205, 215, 230)), (panel_left.x + 20, 166))
         draw_button(btn_least, enabled=True)
         draw_button(btn_disconnect, enabled=True)
 
@@ -333,6 +366,10 @@ while running:
         pygame.draw.rect(screen, (0, 0, 0), draw_pile_rect.move(0, 4), border_radius=14)
         pygame.draw.rect(screen, (35, 40, 52), draw_pile_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
+        # Joker peeking under the deck (zero count indicator)
+        peek_joker = pygame.transform.smoothscale(load_card_image("ZB"), (92, 130))
+        peek_joker = pygame.transform.rotate(peek_joker, -18)
+        screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
         back = pygame.transform.smoothscale(load_card_image("CardBack"), (120, 170))
         screen.blit(back, (draw_pile_rect.x + 15, draw_pile_rect.y + 18))
 
@@ -347,15 +384,15 @@ while running:
             blank = pygame.transform.smoothscale(load_card_image("BlankCard"), (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
-        # hand
+        # hand (sorted + overlapping)
+        hand = sort_hand(hand)
+        n = len(hand)
+        available = panel_right.width - 44 - CARD_W
+        step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
         hx = panel_right.x + 22
         for i, card in enumerate(hand):
-            rect = pygame.Rect(hx + i * (CARD_W + 16), HAND_Y, CARD_W, CARD_H)
+            rect = pygame.Rect(hx + i * step, HAND_Y, CARD_W, CARD_H)
             img = pygame.transform.smoothscale(load_card_image(card), (CARD_W, CARD_H))
-            if dragging_card == card:
-                mx, my = pygame.mouse.get_pos()
-                rect.x = mx + offset_x
-                rect.y = my + offset_y
             screen.blit(img, rect.topleft)
             pygame.draw.rect(screen, (10, 10, 10), rect, width=2, border_radius=8)
 
@@ -396,31 +433,35 @@ while running:
                     disconnect()
 
             if state == STATE_PLAYING:
-                if btn_draw.rect.collidepoint(pos) and current_turn == player_id:
-                    send_action("draw")
-                elif btn_least.rect.collidepoint(pos):
+                if btn_least.rect.collidepoint(pos):
                     send_action("least_count")
-
-                # drag from hand
-                hx = panel_right.x + 22
-                for i, card in enumerate(hand):
-                    rect = pygame.Rect(hx + i * (CARD_W + 16), HAND_Y, CARD_W, CARD_H)
-                    if rect.collidepoint(pos) and current_turn == player_id:
-                        dragging_card = card
-                        offset_x = rect.x - pos[0]
-                        offset_y = rect.y - pos[1]
-                        break
+                elif current_turn == player_id and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
+                    send_action("draw_deck")
+                elif current_turn == player_id and turn_phase == "draw" and discard_rect.collidepoint(pos):
+                    send_action("draw_discard")
+                elif current_turn == player_id and turn_phase == "discard":
+                    # Double-click a hand card to discard it.
+                    hand = sort_hand(hand)
+                    n = len(hand)
+                    available = panel_right.width - 44 - CARD_W
+                    step = 40 if n <= 1 else max(28, min(46, available // max(1, n - 1)))
+                    hx = panel_right.x + 22
+                    clicked: str | None = None
+                    for i in range(n - 1, -1, -1):
+                        card = hand[i]
+                        rect = pygame.Rect(hx + i * step, HAND_Y, CARD_W, CARD_H)
+                        if rect.collidepoint(pos):
+                            clicked = card
+                            break
+                    if clicked:
+                        now = pygame.time.get_ticks()
+                        is_double = clicked == last_click_card and (now - last_click_ms) <= DOUBLE_CLICK_MS
+                        last_click_card = clicked
+                        last_click_ms = now
+                        if is_double:
+                            send_action("discard", clicked)
 
             if state == STATE_RESULTS and btn_back.rect.collidepoint(pos):
                 state = STATE_MENU
                 status_line = "Select Least Count, then connect to the host."
-
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            if state == STATE_PLAYING and dragging_card:
-                if current_turn == player_id:
-                    mx, my = event.pos
-                    drop_rect = pygame.Rect(mx + offset_x, my + offset_y, CARD_W, CARD_H)
-                    if discard_rect.colliderect(drop_rect):
-                        send_action("discard", dragging_card)
-                        # Server will echo authoritative hand via "hand" message.
-                dragging_card = None
+        # (drag/drop removed; discard is done via double-click)
