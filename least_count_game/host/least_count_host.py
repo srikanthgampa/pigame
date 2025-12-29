@@ -223,6 +223,8 @@ scroll_rows_from_bottom = 0
 # Match end
 match_over = False
 match_winner: int | None = None
+dealer_pid: int = HOST_ID
+player_order: list[int] = [HOST_ID]
 
 
 def active_players() -> list[int]:
@@ -247,6 +249,18 @@ def take_open_discard_for_turn(pid: int) -> str | None:
             if discard_pile[j] == ref_card:
                 return discard_pile.pop(j)
     return discard_pile.pop()
+
+
+def num_decks_for_players(n_players: int) -> int:
+    # Number of decks:
+    # 2 - for players <5
+    # 3 - for players 5 to 6
+    # 4 - for players 7 to 8
+    if n_players < 5:
+        return 2
+    if n_players <= 6:
+        return 3
+    return 4
 
 
 STATE_MENU = "menu"
@@ -287,11 +301,11 @@ last_click_card: str | None = None
 
 points_input = TextInput(pygame.Rect(60, 360, 180, 50), value=str(max_points_out))
 
-def build_deck():
+def build_deck(num_decks: int = 1) -> list[str]:
     values = [str(v) for v in range(2, 11)] + ["J","Q","K","A"]
     suits = ["S","C","D","H"]
-    deck = [f"{v}{s}" for v in values for s in suits]
-    deck += ["ZB","ZR"]
+    single = [f"{v}{s}" for v in values for s in suits] + ["ZB", "ZR"]
+    deck = single * max(1, int(num_decks))
     random.shuffle(deck)
     return deck
 
@@ -331,6 +345,13 @@ def broadcast_lobby() -> None:
             pass
 
 
+def recompute_player_order() -> None:
+    global player_order, dealer_pid
+    player_order = [HOST_ID] + sorted(connections.keys())
+    if dealer_pid not in player_order:
+        dealer_pid = player_order[0] if player_order else HOST_ID
+
+
 def send_hand(pid: int) -> None:
     if pid == HOST_ID:
         return
@@ -363,6 +384,7 @@ def broadcast_state() -> None:
         "round_history": round_history[-50:],
         "match_over": match_over,
         "match_winner": match_winner,
+        "dealer_pid": dealer_pid,
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "round_no": round_no,
@@ -387,6 +409,7 @@ def start_match() -> None:
     round_history.clear()
     match_over = False
     match_winner = None
+    recompute_player_order()
     scores_total = {HOST_ID: 0}
     for pid in connections.keys():
         scores_total[pid] = 0
@@ -394,30 +417,49 @@ def start_match() -> None:
 
 
 def start_round() -> None:
-    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, joker_rank, round_no, round_over, last_round_summary, show_available, turn_open_discard
+    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, joker_rank, round_no, round_over, last_round_summary, show_available, turn_open_discard, dealer_pid
     last_round_summary = None
     round_over = False
     round_no += 1
     turn_open_discard = {}
 
-    deck = build_deck()
+    # Determine active players in the configured order (skip eliminated)
+    active_in_order = [pid for pid in player_order if pid in scores_total and pid not in eliminated]
+    if not active_in_order:
+        return
+
+    # Rotate dealer each new round (after round 1)
+    if round_no == 1:
+        if dealer_pid not in active_in_order:
+            dealer_pid = active_in_order[0]
+    else:
+        # advance to next active player in player_order
+        cur = dealer_pid
+        for _ in range(len(player_order) + 1):
+            idx = (player_order.index(cur) + 1) % len(player_order) if cur in player_order else 0
+            cand = player_order[idx]
+            if cand in active_in_order:
+                dealer_pid = cand
+                break
+            cur = cand
+
+    # Turn order starts from player after dealer
+    if dealer_pid in active_in_order:
+        di = active_in_order.index(dealer_pid)
+        turn_order = active_in_order[di + 1 :] + active_in_order[: di + 1]
+    else:
+        turn_order = active_in_order[:]
+
+    # Number of decks depends on number of players in the round
+    deck = build_deck(num_decks_for_players(len(turn_order)))
     discard_pile = []
 
-    # Active players exclude eliminated.
-    active = [HOST_ID] + [pid for pid in sorted(connections.keys()) if pid not in eliminated]
-    # If host is eliminated, also exclude them from play (but host still controls UI).
-    if HOST_ID in eliminated:
-        active = [pid for pid in active if pid != HOST_ID]
-
-    turn_order = active
     current_turn_idx = 0
     # Rule: discard first, then pick.
     turn_phase = {pid: "discard" for pid in turn_order}
     show_available = {pid: False for pid in turn_order}
     if turn_order:
         show_available[turn_order[0]] = True
-        if discard_pile:
-            turn_open_discard[turn_order[0]] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
 
     # Pick designated joker card for this round (actual card, 0 points for round).
     joker_card = deck.pop() if deck else None
@@ -433,6 +475,9 @@ def start_round() -> None:
     # Start discard pile
     if deck:
         discard_pile.append(deck.pop())
+    # Capture the open discard for the first player of the round (fixes first turn behavior)
+    if turn_order and discard_pile:
+        turn_open_discard[turn_order[0]] = {"idx": len(discard_pile) - 1, "card": discard_pile[-1]}
 
     # Inform clients
     for pid, conn in list(connections.items()):
@@ -447,6 +492,7 @@ def start_round() -> None:
                         "show_penalty": SHOW_PENALTY,
                         "max_points_out": max_points_out,
                         "discard_first": True,
+                        "dealer_pid": dealer_pid,
                     },
                 },
             )
@@ -492,6 +538,7 @@ def accept_loop() -> None:
             pass
         print(f"Player {pid} connected from {addr}")
         threading.Thread(target=recv_loop, args=(conn, pid), daemon=True).start()
+        recompute_player_order()
         broadcast_lobby()
 
 def next_turn() -> None:
@@ -609,6 +656,8 @@ def resolve_show(show_pid: int) -> None:
                 send_json(conn, {"action": "match_end", "winner": match_winner, "scores_total": scores_total})
             except Exception:
                 pass
+        broadcast_state()
+        return
 
     # Tell clients round ended
     for pid, conn in list(connections.items()):
@@ -639,6 +688,7 @@ while running:
                 except Exception:
                     pass
             if not game_started:
+                recompute_player_order()
                 broadcast_lobby()
             continue
 
@@ -847,7 +897,14 @@ while running:
         draw_button(btn_show, enabled=can_show)
         if round_over:
             draw_button(btn_next_round, enabled=True)
-        if round_over and last_round_summary:
+        if match_over and match_winner is not None:
+            msg = f"GAME OVER — Winner: {player_names.get(match_winner, f'Player {match_winner}')}"
+            banner = pygame.Rect(180, score_bar.bottom + 6, BASE_SIZE[0] - 200, 34)
+            pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
+            pygame.draw.rect(screen, (60, 40, 15), banner, border_radius=10)
+            pygame.draw.rect(screen, (255, 235, 120), banner, width=2, border_radius=10)
+            screen.blit(FONT_SM.render(msg, True, (245, 235, 200)), (banner.x + 10, banner.y + 8))
+        elif round_over and last_round_summary:
             show_pid = last_round_summary.get("show_pid")
             show_total = last_round_summary.get("show_total")
             outcome = last_round_summary.get("outcome")
@@ -856,7 +913,7 @@ while running:
             else:
                 same_or_less = last_round_summary.get("same_or_less_players", [])
                 msg = f"Player {show_pid} SHOWED {show_total} and got PENALTY (+{SHOW_PENALTY}). Same/less: {same_or_less}"
-            banner = pygame.Rect(180, 92, 780, 34)
+            banner = pygame.Rect(180, score_bar.bottom + 6, BASE_SIZE[0] - 200, 34)
             pygame.draw.rect(screen, (0, 0, 0), banner.move(0, 2), border_radius=10)
             pygame.draw.rect(screen, (40, 35, 20), banner, border_radius=10)
             pygame.draw.rect(screen, (130, 110, 70), banner, width=2, border_radius=10)
