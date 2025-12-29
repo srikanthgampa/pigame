@@ -15,8 +15,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]  # /least_count_game
 ASSETS_DIR = BASE_DIR / "assets" / "cards"
 
 pygame.init()
-# Pi Zero W performance: keep a smaller virtual canvas and scale up.
-BASE_SIZE = (960, 540)  # virtual canvas; we scale to window size
+BASE_SIZE = (1280, 720)  # virtual canvas; we scale to window size
 WINDOWED_SIZE = BASE_SIZE
 _is_fullscreen = False
 window = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE)
@@ -24,7 +23,7 @@ screen = pygame.Surface(BASE_SIZE)
 pygame.display.set_caption("Raspberry Pi Gaming Hub (Player)")
 clock = pygame.time.Clock()
 
-USE_SMOOTH_SCALE = False
+USE_SMOOTH_SCALE = True
 
 
 _sprite_cache: dict[tuple[str, int, int, int], pygame.Surface] = {}
@@ -278,14 +277,14 @@ btn_connect = Button(pygame.Rect(60, 420, 320, 56), "Connect")
 btn_disconnect = Button(pygame.Rect(60, 520, 320, 56), "Disconnect")
 btn_back = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
 
-_pile_w, _pile_h = 140, 196
+_pile_w, _pile_h = 160, 224
 draw_pile_rect = pygame.Rect(BASE_SIZE[0] // 2 - 190, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 discard_rect = pygame.Rect(BASE_SIZE[0] // 2 + 30, BASE_SIZE[1] // 2 - 120, _pile_w, _pile_h)
 btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
 btn_show = Button(pygame.Rect(BASE_SIZE[0] - 170, 128, 120, 36), "SHOW")
 btn_disconnect_game = Button(pygame.Rect(BASE_SIZE[0] - 110, 20, 90, 32), "Exit")
 
-CARD_W, CARD_H = 78, 117
+CARD_W, CARD_H = 92, 138
 HAND_Y = BASE_SIZE[1] - 190
 
 ip_input = TextInput(pygame.Rect(60, 250, 320, 50), value=host_ip)
@@ -422,6 +421,12 @@ while running:
             state = STATE_PLAYING
             round_over = True
             round_summary = data.get("summary")
+            continue
+
+        if action == "match_end":
+            winner = data.get("winner")
+            print("Match over! Winner:", winner, "Final totals:", data.get("scores_total"))
+            round_over = True
             continue
 
         if action == "end":
@@ -594,9 +599,9 @@ while running:
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
         # Joker peeking under the deck (designated joker for the round)
         peek_name = joker_card or "ZB"
-        peek_joker = get_sprite(peek_name, (78, 110), angle=-18)
+        peek_joker = get_sprite(peek_name, (92, 130), angle=-18)
         screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
-        back = get_sprite("CardBack", (110, 156))
+        back = get_sprite("CardBack", (120, 170))
         screen.blit(back, (draw_pile_rect.x + 15, draw_pile_rect.y + 18))
 
         # discard pile
@@ -604,10 +609,10 @@ while running:
         pygame.draw.rect(screen, (35, 40, 52), discard_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), discard_rect, width=2, border_radius=14)
         if discard_top:
-            img = get_sprite(discard_top, (110, 156))
+            img = get_sprite(discard_top, (120, 170))
             screen.blit(img, (discard_rect.x + 15, discard_rect.y + 18))
         else:
-            blank = get_sprite("BlankCard", (110, 156))
+            blank = get_sprite("BlankCard", (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
         # hand (sorted + overlapping)
@@ -633,7 +638,7 @@ while running:
             pygame.draw.rect(screen, (25, 28, 35), rect, border_radius=12)
             pygame.draw.rect(screen, (90, 100, 120), rect, width=2, border_radius=12)
 
-            back_small = get_sprite("CardBack", (42, 60))
+            back_small = get_sprite("CardBack", (48, 68))
             # host sends int keys; be tolerant
             count = hand_counts.get(pid, hand_counts.get(str(pid), 0))
             stacks = min(int(count or 0), 5)
@@ -679,7 +684,7 @@ while running:
 
     window.blit(pygame.transform.scale(screen, window.get_size()), (0, 0))
     pygame.display.flip()
-    clock.tick(30)
+    clock.tick(60)
 
     # Events
     for event in pygame.event.get():
