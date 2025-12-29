@@ -21,8 +21,14 @@ clock = pygame.time.Clock()
 FONT = pygame.font.SysFont("dejavusans", 26)
 FONT_SM = pygame.font.SysFont("dejavusans", 18)
 FONT_LG = pygame.font.SysFont("dejavusans", 44)
+FONT_XS = pygame.font.SysFont("dejavusans", 16)
 
 _image_cache: dict[str, pygame.Surface] = {}
+
+# Round-designated joker (rank like "Q") + display card (like "QH")
+joker_rank: str | None = None
+joker_card: str | None = None
+show_limit: int = 8
 
 
 def load_card_image(card_name: str) -> pygame.Surface:
@@ -35,11 +41,11 @@ def load_card_image(card_name: str) -> pygame.Surface:
 
 
 def card_sort_key(card: str) -> tuple[int, int]:
-    if card in ("ZB", "ZR"):
+    face = card[:-1] if len(card) > 1 else card
+    if (joker_rank is not None and face == joker_rank) or card in ("ZB", "ZR"):
         rank = 0
         suit = 0
     else:
-        face = card[:-1]
         suit_char = card[-1]
         suit_order = {"S": 0, "C": 1, "D": 2, "H": 3}
         suit = suit_order.get(suit_char, 9)
@@ -61,6 +67,24 @@ def card_sort_key(card: str) -> tuple[int, int]:
 
 def sort_hand(cards: list[str]) -> list[str]:
     return sorted(cards, key=card_sort_key)
+
+
+def card_points(card: str) -> int:
+    face = card[:-1] if len(card) > 1 else card
+    if (joker_rank is not None and face == joker_rank) or card in ("ZB", "ZR"):
+        return 0
+    if face == "A":
+        return 1
+    if face in ("J", "Q", "K"):
+        return 10
+    try:
+        return int(face)
+    except Exception:
+        return 0
+
+
+def hand_total(cards: list[str]) -> int:
+    return sum(card_points(c) for c in cards)
 
 
 def send_json(sock: socket.socket, payload: dict) -> None:
@@ -181,6 +205,11 @@ deck_count: int = 0
 turn_phase: str = "draw"  # phase for the current turn player ("draw" or "discard")
 players_list: list[dict] = []
 last_results: dict | None = None
+scores_total: dict = {}
+eliminated: list[int] = []
+round_no: int = 0
+round_over: bool = False
+hand_totals: dict = {}
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -194,6 +223,7 @@ btn_back = Button(pygame.Rect(60, 520, 320, 56), "Back to Menu")
 draw_pile_rect = pygame.Rect(600, 150, 150, 210)
 discard_rect = pygame.Rect(770, 150, 150, 210)
 btn_least = Button(pygame.Rect(60, 220, 180, 40), "Least Count")
+btn_show = Button(pygame.Rect(820, 140, 120, 36), "SHOW")
 
 CARD_W, CARD_H = 92, 138
 HAND_Y = 460
@@ -289,6 +319,11 @@ while running:
 
         if action == "start":
             state = STATE_PLAYING
+            rules = data.get("rules", {}) or {}
+            try:
+                show_limit = int(rules.get("show_limit", show_limit) or show_limit)
+            except Exception:
+                show_limit = show_limit
             continue
 
         if action == "hand":
@@ -302,6 +337,19 @@ while running:
             current_turn = st.get("turn")
             deck_count = int(st.get("deck_count", 0) or 0)
             turn_phase = str(st.get("turn_phase", "draw") or "draw")
+            joker_card = st.get("joker_card")
+            joker_rank = st.get("joker_rank")
+            scores_total = st.get("scores_total", {}) or {}
+            eliminated = list(st.get("eliminated", []) or [])
+            round_no = int(st.get("round_no", 0) or 0)
+            round_over = bool(st.get("round_over", False))
+            hand_totals = st.get("hand_totals", {}) or {}
+            continue
+
+        if action == "round_end":
+            # Round ended summary; state will also reflect round_over.
+            state = STATE_PLAYING
+            round_over = True
             continue
 
         if action == "end":
@@ -350,24 +398,47 @@ while running:
         draw_button(btn_disconnect, enabled=True)
 
     elif state == STATE_PLAYING:
-        if current_turn == player_id:
-            turn_text = "Your Turn"
-        else:
-            turn_text = f"Waiting for Player {current_turn}"
-        screen.blit(FONT.render(turn_text, True, (255, 235, 120)), (panel_left.x + 20, 100))
-        screen.blit(FONT_SM.render(f"Deck: {deck_count} cards", True, (210, 220, 235)), (panel_left.x + 20, 138))
-        if current_turn == player_id:
+        # Simplified full-screen play view: scoreboard + table + hand
+        score_bar = pygame.Rect(20, 10, 940, 64)
+        pygame.draw.rect(screen, (0, 0, 0), score_bar.move(0, 3), border_radius=14)
+        pygame.draw.rect(screen, (25, 28, 35), score_bar, border_radius=14)
+        pygame.draw.rect(screen, (90, 100, 120), score_bar, width=2, border_radius=14)
+
+        # Totals (top) + per-round hand totals (from host)
+        x = score_bar.x + 16
+        y = score_bar.y + 18
+        # show in player-id order if possible
+        for pid in sorted(scores_total.keys(), key=lambda k: int(k) if str(k).isdigit() else 999):
+            pts = scores_total.get(pid, 0)
+            out = " OUT" if int(pid) in eliminated else ""
+            txt = FONT_SM.render(f"P{pid}:{pts}{out}", True, (235, 240, 248))
+            screen.blit(txt, (x, y))
+            x += txt.get_width() + 14
+
+        totals_line = "  ".join([f"P{pid}:{hand_totals.get(str(pid), hand_totals.get(pid, '?'))}" for pid in sorted(hand_totals.keys(), key=lambda k: int(k) if str(k).isdigit() else 999)])
+        if totals_line:
+            screen.blit(FONT_XS.render(totals_line, True, (210, 220, 235)), (score_bar.x + 16, score_bar.y + 42))
+
+        # Turn hint
+        hint = ""
+        if round_over:
+            hint = "Round over. Waiting for host to start next round."
+        elif current_turn == player_id:
             hint = "Click deck/discard to draw" if turn_phase == "draw" else "Double-click a card to discard"
-            screen.blit(FONT_SM.render(hint, True, (205, 215, 230)), (panel_left.x + 20, 166))
-        draw_button(btn_least, enabled=True)
+        if hint:
+            screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, 92))
+
+        can_show = (not round_over) and (current_turn == player_id) and (hand_total(hand) <= show_limit)
+        draw_button(btn_show, enabled=can_show)
         draw_button(btn_disconnect, enabled=True)
 
         # draw pile
         pygame.draw.rect(screen, (0, 0, 0), draw_pile_rect.move(0, 4), border_radius=14)
         pygame.draw.rect(screen, (35, 40, 52), draw_pile_rect, border_radius=14)
         pygame.draw.rect(screen, (90, 100, 120), draw_pile_rect, width=2, border_radius=14)
-        # Joker peeking under the deck (zero count indicator)
-        peek_joker = pygame.transform.smoothscale(load_card_image("ZB"), (92, 130))
+        # Joker peeking under the deck (designated joker for the round)
+        peek_name = joker_card or "ZB"
+        peek_joker = pygame.transform.smoothscale(load_card_image(peek_name), (92, 130))
         peek_joker = pygame.transform.rotate(peek_joker, -18)
         screen.blit(peek_joker, (draw_pile_rect.x + 10, draw_pile_rect.bottom - 78))
         back = pygame.transform.smoothscale(load_card_image("CardBack"), (120, 170))
@@ -433,8 +504,8 @@ while running:
                     disconnect()
 
             if state == STATE_PLAYING:
-                if btn_least.rect.collidepoint(pos):
-                    send_action("least_count")
+                if btn_show.rect.collidepoint(pos) and (not round_over) and current_turn == player_id and (hand_total(hand) <= show_limit):
+                    send_action("show")
                 elif current_turn == player_id and turn_phase == "draw" and draw_pile_rect.collidepoint(pos):
                     send_action("draw_deck")
                 elif current_turn == player_id and turn_phase == "draw" and discard_rect.collidepoint(pos):
