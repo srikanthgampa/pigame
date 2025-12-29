@@ -142,19 +142,30 @@ class TextInput:
         self.rect = rect
         self.value = value
         self.active = False
+        self._replace_on_next_key = False
 
     def handle_event(self, event: pygame.event.Event) -> None:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            self.active = self.rect.collidepoint(to_canvas(event.pos))
+            clicked = self.rect.collidepoint(to_canvas(event.pos))
+            # If the user clicks into the box, make it easy to replace the entire value.
+            if clicked and not self.active:
+                self._replace_on_next_key = True
+            self.active = clicked
         if event.type == pygame.KEYDOWN and self.active:
             if event.key == pygame.K_BACKSPACE:
                 self.value = self.value[:-1]
+                self._replace_on_next_key = False
             elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 self.active = False
+                self._replace_on_next_key = False
             else:
                 if len(self.value) < 6 and event.unicode and event.unicode.isprintable():
                     if event.unicode.isdigit():
-                        self.value += event.unicode
+                        if self._replace_on_next_key:
+                            self.value = event.unicode
+                            self._replace_on_next_key = False
+                        else:
+                            self.value += event.unicode
 
     def draw(self, label: str) -> None:
         pygame.draw.rect(screen, (0, 0, 0), self.rect.move(0, 3), border_radius=10)
