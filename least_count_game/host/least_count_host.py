@@ -15,7 +15,9 @@ BASE_DIR = Path(__file__).resolve().parents[1]  # /least_count_game
 ASSETS_DIR = BASE_DIR / "assets" / "cards"
 
 pygame.init()
-screen = pygame.display.set_mode((980, 620))
+WINDOWED_SIZE = (980, 620)
+_is_fullscreen = False
+screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
 pygame.display.set_caption("Raspberry Pi Gaming Hub (Host)")
 clock = pygame.time.Clock()
 
@@ -277,12 +279,14 @@ def send_hand(pid: int) -> None:
 
 def broadcast_state() -> None:
     current_pid = turn_order[current_turn_idx] if turn_order else None
+    hand_counts = {pid: len(hands.get(pid, [])) for pid in turn_order}
     state_msg = {
         "discard_top": discard_pile[-1] if discard_pile else None,
         "turn": current_pid,
         "turn_phase": turn_phase.get(current_pid, "discard") if current_pid is not None else "discard",
         "deck_count": len(deck),
         "players": turn_order[:],
+        "hand_counts": hand_counts,
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "round_no": round_no,
@@ -677,6 +681,37 @@ while running:
             pygame.draw.rect(screen, (130, 110, 70), banner, width=2, border_radius=10)
             screen.blit(FONT_SM.render(msg, True, (245, 235, 200)), (banner.x + 10, banner.y + 8))
 
+        # Live-table: other players' hands face down + spotlight active player
+        def _draw_seat(pid: int, rect: pygame.Rect, active_pid: int | None) -> None:
+            is_active = (active_pid == pid) and (not round_over)
+            if is_active:
+                pygame.draw.rect(screen, (255, 235, 120), rect.inflate(16, 16), width=4, border_radius=14)
+            pygame.draw.rect(screen, (0, 0, 0), rect.move(0, 3), border_radius=12)
+            pygame.draw.rect(screen, (25, 28, 35), rect, border_radius=12)
+            pygame.draw.rect(screen, (90, 100, 120), rect, width=2, border_radius=12)
+
+            back_small = pygame.transform.smoothscale(load_card_image("CardBack"), (48, 68))
+            count = len(hands.get(pid, []))
+            stacks = min(count, 5)
+            sx = rect.x + 10
+            sy = rect.y + 10
+            for i in range(stacks):
+                screen.blit(back_small, (sx + i * 6, sy + i * 2))
+            label = "Host" if pid == HOST_ID else f"P{pid}"
+            screen.blit(FONT_XS.render(f"{label} ({count})", True, (235, 240, 248)), (rect.x + 10, rect.bottom - 20))
+
+        active_pid = turn_order[current_turn_idx] if turn_order else None
+        # local seat (host) bottom-left; others across top row
+        host_seat = pygame.Rect(30, 540, 140, 80)
+        _draw_seat(HOST_ID, host_seat, active_pid)
+        others = [pid for pid in turn_order if pid != HOST_ID]
+        if others:
+            total_w = 920
+            step = total_w // max(1, len(others))
+            for i, pid in enumerate(others):
+                seat = pygame.Rect(30 + i * step, 100, 140, 80)
+                _draw_seat(pid, seat, active_pid)
+
     elif state == STATE_RESULTS:
         screen.blit(FONT.render("Results", True, (230, 235, 245)), (panel_left.x + 20, 86))
         if last_results:
@@ -735,6 +770,20 @@ while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_F11:
+                _is_fullscreen = not _is_fullscreen
+                if _is_fullscreen:
+                    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN | pygame.SCALED)
+                else:
+                    screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+            elif event.key == pygame.K_ESCAPE and _is_fullscreen:
+                _is_fullscreen = False
+                screen = pygame.display.set_mode(WINDOWED_SIZE, pygame.RESIZABLE | pygame.SCALED)
+
+        if event.type == pygame.VIDEORESIZE and not _is_fullscreen:
+            screen = pygame.display.set_mode(event.size, pygame.RESIZABLE | pygame.SCALED)
 
         if state == STATE_MENU:
             points_input.handle_event(event)
