@@ -43,12 +43,12 @@ def card_sort_key(card: str) -> tuple[int, int]:
     Ascending: jokers, A, 2..10, J, Q, K; then suit.
     Jokers are always zero-count.
     """
-    # Designated joker (picked card for the round) sorts first too.
-    if card == joker_card or card in ("ZB", "ZR"):
+    # Designated joker is by rank (e.g. all Queens if joker is any Q*).
+    face = card[:-1] if len(card) > 1 else card
+    if (joker_rank is not None and face == joker_rank) or card in ("ZB", "ZR"):
         rank = 0
         suit = 0
     else:
-        face = card[:-1]
         suit_char = card[-1]
         suit_order = {"S": 0, "C": 1, "D": 2, "H": 3}
         suit = suit_order.get(suit_char, 9)
@@ -176,6 +176,7 @@ max_points_out = 200  # configurable: out if score > max_points_out (e.g. 200 ->
 
 round_no = 0
 joker_card: str | None = None  # designated joker for the round (0 points)
+joker_rank: str | None = None  # e.g. "Q" when joker_card is any "Q*"
 scores_total: dict[int, int] = {HOST_ID: 0}
 eliminated: set[int] = set()
 round_over = False
@@ -227,10 +228,10 @@ def build_deck():
 
 
 def card_points(card: str) -> int:
-    # 0 points for jokers + designated joker card for this round.
-    if card == joker_card or card in ("ZB", "ZR"):
+    # 0 points for jokers + designated joker rank for this round.
+    face = card[:-1] if len(card) > 1 else card
+    if (joker_rank is not None and face == joker_rank) or card in ("ZB", "ZR"):
         return 0
-    face = card[:-1]
     if face == "A":
         return 1
     if face in ("J", "Q", "K"):
@@ -276,6 +277,7 @@ def send_hand(pid: int) -> None:
 
 def broadcast_state() -> None:
     current_pid = turn_order[current_turn_idx] if turn_order else None
+    hand_totals = {pid: hand_total(pid) for pid in turn_order}
     state_msg = {
         "discard_top": discard_pile[-1] if discard_pile else None,
         "turn": current_pid,
@@ -286,6 +288,8 @@ def broadcast_state() -> None:
         "eliminated": sorted(eliminated),
         "round_no": round_no,
         "joker_card": joker_card,
+        "joker_rank": joker_rank,
+        "hand_totals": hand_totals,
         "round_over": round_over,
         "max_points_out": max_points_out,
     }
@@ -309,7 +313,7 @@ def start_match() -> None:
 
 
 def start_round() -> None:
-    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, round_no, round_over, last_round_summary
+    global deck, discard_pile, turn_order, current_turn_idx, turn_phase, joker_card, joker_rank, round_no, round_over, last_round_summary
     last_round_summary = None
     round_over = False
     round_no += 1
@@ -329,6 +333,7 @@ def start_round() -> None:
 
     # Pick designated joker card for this round (actual card, 0 points for round).
     joker_card = deck.pop() if deck else None
+    joker_rank = (joker_card[:-1] if joker_card and joker_card not in ("ZB", "ZR") else joker_card) if joker_card else None
 
     # Deal hands
     for pid in turn_order:
@@ -532,9 +537,11 @@ while running:
         if action == "discard" and is_turn and phase == "discard":
             card = data.get("card")
             if isinstance(card, str) and card in hands.get(pid, []):
-                hands[pid].remove(card)
+                face = card[:-1] if len(card) > 1 else card
+                removed = [c for c in hands.get(pid, []) if (c[:-1] if len(c) > 1 else c) == face]
+                hands[pid] = [c for c in hands.get(pid, []) if (c[:-1] if len(c) > 1 else c) != face]
                 sort_hand(pid)
-                discard_pile.append(card)
+                discard_pile.extend(removed)
                 send_hand(pid)
                 turn_phase[pid] = "draw"
                 next_turn()
@@ -779,9 +786,11 @@ while running:
                         last_click_card = clicked
                         last_click_ms = now
                         if is_double and clicked in hands.get(HOST_ID, []):
-                            hands[HOST_ID].remove(clicked)
+                            face = clicked[:-1] if len(clicked) > 1 else clicked
+                            removed = [c for c in hands.get(HOST_ID, []) if (c[:-1] if len(c) > 1 else c) == face]
+                            hands[HOST_ID] = [c for c in hands.get(HOST_ID, []) if (c[:-1] if len(c) > 1 else c) != face]
                             sort_hand(HOST_ID)
-                            discard_pile.append(clicked)
+                            discard_pile.extend(removed)
                             turn_phase[HOST_ID] = "draw"
                             next_turn()
                             broadcast_state()
