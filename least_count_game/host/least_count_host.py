@@ -220,6 +220,34 @@ round_history: list[dict] = []  # list of {"round_no": int, "round_points": {pid
 # Scoreboard scrolling (round rows only)
 scroll_rows_from_bottom = 0
 
+# Match end
+match_over = False
+match_winner: int | None = None
+
+
+def active_players() -> list[int]:
+    # Anyone in scores_total who isn't eliminated.
+    return [pid for pid in sorted(scores_total.keys()) if pid not in eliminated]
+
+
+def take_open_discard_for_turn(pid: int) -> str | None:
+    """
+    For 'discard first, then pick' we allow picking the discard card that was open
+    at the start of the player's turn (not the card they just discarded).
+    """
+    if not discard_pile:
+        return None
+    ref = turn_open_discard.get(pid, {})
+    idx = ref.get("idx")
+    ref_card = ref.get("card")
+    if isinstance(idx, int) and isinstance(ref_card, str) and 0 <= idx < len(discard_pile) and discard_pile[idx] == ref_card:
+        return discard_pile.pop(idx)
+    if isinstance(ref_card, str):
+        for j in range(len(discard_pile) - 1, -1, -1):
+            if discard_pile[j] == ref_card:
+                return discard_pile.pop(j)
+    return discard_pile.pop()
+
 
 STATE_MENU = "menu"
 STATE_LOBBY = "lobby"
@@ -333,6 +361,8 @@ def broadcast_state() -> None:
         "hand_counts": hand_counts,
         "player_names": {pid: player_names.get(pid, f"Player {pid}") for pid in scores_total.keys()},
         "round_history": round_history[-50:],
+        "match_over": match_over,
+        "match_winner": match_winner,
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "round_no": round_no,
@@ -349,12 +379,14 @@ def broadcast_state() -> None:
 
 
 def start_match() -> None:
-    global game_started, scores_total, eliminated, round_no, last_round_summary
+    global game_started, scores_total, eliminated, round_no, last_round_summary, match_over, match_winner
     game_started = True
     last_round_summary = None
     round_no = 0
     eliminated = set()
     round_history.clear()
+    match_over = False
+    match_winner = None
     scores_total = {HOST_ID: 0}
     for pid in connections.keys():
         scores_total[pid] = 0
@@ -565,6 +597,19 @@ def resolve_show(show_pid: int) -> None:
     )
     round_over = True
 
+    # Match end: if only one active player remains, declare winner and end match.
+    global match_over, match_winner, game_started
+    remaining = active_players()
+    if len(remaining) == 1:
+        match_over = True
+        match_winner = remaining[0]
+        game_started = False
+        for pid, conn in list(connections.items()):
+            try:
+                send_json(conn, {"action": "match_end", "winner": match_winner, "scores_total": scores_total})
+            except Exception:
+                pass
+
     # Tell clients round ended
     for pid, conn in list(connections.items()):
         try:
@@ -643,23 +688,9 @@ while running:
                 broadcast_state()
         elif action == "draw_discard" and is_turn and phase == "draw" and not round_over:
             if discard_pile:
-                # Take the discard card that was open at the start of this turn (not the card you just discarded).
-                ref = turn_open_discard.get(pid, {})
-                card_to_take = None
-                idx = ref.get("idx")
-                ref_card = ref.get("card")
-                if isinstance(idx, int) and isinstance(ref_card, str) and 0 <= idx < len(discard_pile) and discard_pile[idx] == ref_card:
-                    card_to_take = discard_pile.pop(idx)
-                else:
-                    # Fallback: remove one matching instance from top-down, else take top.
-                    if isinstance(ref_card, str):
-                        for j in range(len(discard_pile) - 1, -1, -1):
-                            if discard_pile[j] == ref_card:
-                                card_to_take = discard_pile.pop(j)
-                                break
-                    if card_to_take is None:
-                        card_to_take = discard_pile.pop()
-                hands[pid].append(card_to_take)
+                card_to_take = take_open_discard_for_turn(pid)
+                if card_to_take is not None:
+                    hands[pid].append(card_to_take)
                 sort_hand(pid)
                 send_hand(pid)
                 turn_phase[pid] = "discard"
@@ -804,6 +835,12 @@ while running:
             hint = "Round over. Click Next Round (host) to continue."
         if hint:
             screen.blit(FONT_SM.render(hint, True, (255, 235, 120)), (30, score_bar.bottom + 10))
+
+        # Make it obvious which discard card you'll take this turn
+        if (not round_over) and (not match_over) and turn_order and (turn_order[current_turn_idx] == HOST_ID) and (phase == "draw"):
+            pick_card = turn_open_discard.get(HOST_ID, {}).get("card")
+            if pick_card:
+                screen.blit(FONT_XS.render(f"Discard pick: {pick_card}", True, (210, 220, 235)), (30, score_bar.bottom + 34))
 
         # Show is allowed only at the start of your turn (before discard/pick), and only when <= show limit.
         can_show = (not round_over) and (turn == HOST_ID) and (phase == "discard") and show_available.get(HOST_ID, False) and (hand_total(HOST_ID) <= SHOW_LIMIT)
@@ -993,7 +1030,9 @@ while running:
                         broadcast_state()
                 elif (not round_over) and turn == HOST_ID and phase == "draw" and discard_rect.collidepoint(pos):
                     if discard_pile:
-                        hands[HOST_ID].append(discard_pile.pop())
+                        card_to_take = take_open_discard_for_turn(HOST_ID)
+                        if card_to_take is not None:
+                            hands[HOST_ID].append(card_to_take)
                         sort_hand(HOST_ID)
                         turn_phase[HOST_ID] = "discard"
                         show_available[HOST_ID] = False
