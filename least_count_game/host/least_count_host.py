@@ -227,6 +227,9 @@ match_end_reason: str | None = None  # "points" | "player_exit" | "host_closed"
 dealer_pid: int = HOST_ID
 player_order: list[int] = [HOST_ID]
 
+# Discard feedback (to show how many cards were discarded)
+last_discard_info: dict | None = None  # {"pid":int,"face":str,"count":int,"t":int}
+
 
 def active_players() -> list[int]:
     # Anyone in scores_total who isn't eliminated.
@@ -409,6 +412,7 @@ def broadcast_state() -> None:
         "match_winner": match_winner,
         "match_end_reason": match_end_reason,
         "dealer_pid": dealer_pid,
+        "last_discard": last_discard_info,
         "scores_total": scores_total,
         "eliminated": sorted(eliminated),
         "round_no": round_no,
@@ -772,7 +776,6 @@ while running:
                 # Determine if match ends due to exit
                 remaining = active_players()
                 if len(remaining) == 1:
-                    global match_over, match_winner, match_end_reason
                     match_over = True
                     match_winner = remaining[0]
                     match_end_reason = "player_exit"
@@ -825,6 +828,7 @@ while running:
                 hands[pid] = [c for c in hands.get(pid, []) if (c[:-1] if len(c) > 1 else c) != face]
                 sort_hand(pid)
                 discard_pile.extend(removed)
+                last_discard_info = {"pid": pid, "face": face, "count": len(removed), "t": pygame.time.get_ticks()}
                 show_available[pid] = False  # show is no longer allowed after discard
                 send_hand(pid)
                 # Exception: if open card is same rank, player may discard without picking.
@@ -1131,6 +1135,22 @@ while running:
             blank = pygame.transform.smoothscale(load_card_image("BlankCard"), (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
 
+        # Show how many cards were discarded (useful when discarding multiples)
+        if last_discard_info and isinstance(last_discard_info.get("t"), int):
+            age = pygame.time.get_ticks() - int(last_discard_info["t"])
+            if 0 <= age <= 3000:
+                cnt = int(last_discard_info.get("count", 1) or 1)
+                face = str(last_discard_info.get("face", ""))
+                who = int(last_discard_info.get("pid", 0) or 0)
+                if cnt > 1:
+                    badge = pygame.Rect(discard_rect.right - 42, discard_rect.y + 10, 34, 24)
+                    pygame.draw.rect(screen, (0, 0, 0), badge.move(0, 2), border_radius=8)
+                    pygame.draw.rect(screen, (255, 235, 120), badge, border_radius=8)
+                    screen.blit(FONT_XS.render(f"x{cnt}", True, (20, 20, 20)), (badge.x + 6, badge.y + 5))
+                label = "Host" if who == HOST_ID else player_names.get(who, f"P{who}")
+                msg = f"{label} discarded {cnt}×{face}"
+                screen.blit(FONT_XS.render(msg, True, (235, 240, 248)), (discard_rect.x - 10, discard_rect.bottom + 6))
+
         # Host hand (sorted + overlapping)
         if HOST_ID in hands:
             sort_hand(HOST_ID)
@@ -1288,6 +1308,7 @@ while running:
                             hands[HOST_ID] = [c for c in hands.get(HOST_ID, []) if (c[:-1] if len(c) > 1 else c) != face]
                             sort_hand(HOST_ID)
                             discard_pile.extend(removed)
+                            last_discard_info = {"pid": HOST_ID, "face": face, "count": len(removed), "t": pygame.time.get_ticks()}
                             show_available[HOST_ID] = False
                             # Exception: if open card is same rank, you may discard without picking.
                             if prev_top_face is not None and prev_top_face == face:
