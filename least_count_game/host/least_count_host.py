@@ -124,7 +124,15 @@ def draw_button(btn: Button, enabled: bool = True) -> None:
     pygame.draw.rect(screen, color, btn.rect, border_radius=10)
     pygame.draw.rect(screen, (255, 255, 255), btn.rect, width=2, border_radius=10)
 
-    text = FONT.render(btn.label, True, (10, 10, 10))
+    # Auto-fit label inside the button (fixes long labels like "Close Game")
+    font = FONT
+    text = font.render(btn.label, True, (10, 10, 10))
+    if text.get_width() > btn.rect.width - 20:
+        font = FONT_SM
+        text = font.render(btn.label, True, (10, 10, 10))
+    if text.get_width() > btn.rect.width - 20:
+        font = FONT_XS
+        text = font.render(btn.label, True, (10, 10, 10))
     screen.blit(text, text.get_rect(center=btn.rect.center))
 
 
@@ -138,9 +146,11 @@ def draw_panel(rect: pygame.Rect, title: str | None = None) -> None:
 
 
 class TextInput:
-    def __init__(self, rect: pygame.Rect, value: str = "") -> None:
+    def __init__(self, rect: pygame.Rect, value: str = "", *, numeric_only: bool = True, max_len: int = 6) -> None:
         self.rect = rect
         self.value = value
+        self.numeric_only = numeric_only
+        self.max_len = max(1, int(max_len))
         self.active = False
         self._replace_on_next_key = False
 
@@ -159,13 +169,15 @@ class TextInput:
                 self.active = False
                 self._replace_on_next_key = False
             else:
-                if len(self.value) < 6 and event.unicode and event.unicode.isprintable():
-                    if event.unicode.isdigit():
-                        if self._replace_on_next_key:
-                            self.value = event.unicode
-                            self._replace_on_next_key = False
-                        else:
-                            self.value += event.unicode
+                if len(self.value) < self.max_len and event.unicode and event.unicode.isprintable():
+                    ch = event.unicode
+                    if self.numeric_only and (not ch.isdigit()):
+                        return
+                    if self._replace_on_next_key:
+                        self.value = ch
+                        self._replace_on_next_key = False
+                    else:
+                        self.value += ch
 
     def draw(self, label: str) -> None:
         pygame.draw.rect(screen, (0, 0, 0), self.rect.move(0, 3), border_radius=10)
@@ -173,7 +185,12 @@ class TextInput:
         pygame.draw.rect(screen, (30, 30, 30), self.rect, width=2, border_radius=10)
         lab = FONT_SM.render(label, True, (230, 235, 245))
         screen.blit(lab, (self.rect.x, self.rect.y - 22))
-        txt = FONT.render(self.value or "", True, (10, 10, 10))
+        # Keep text readable inside the input box
+        font = FONT
+        txt = font.render(self.value or "", True, (10, 10, 10))
+        if txt.get_width() > self.rect.width - 20:
+            font = FONT_SM
+            txt = font.render(self.value or "", True, (10, 10, 10))
         screen.blit(txt, (self.rect.x + 10, self.rect.y + 10))
 
 
@@ -305,7 +322,8 @@ DOUBLE_CLICK_MS = 350
 last_click_ms = 0
 last_click_card: str | None = None
 
-points_input = TextInput(pygame.Rect(60, 360, 180, 50), value=str(max_points_out))
+host_name_input = TextInput(pygame.Rect(60, 320, 320, 50), value="Host", numeric_only=False, max_len=16)
+points_input = TextInput(pygame.Rect(60, 420, 180, 50), value=str(max_points_out), numeric_only=True, max_len=6)
 
 def build_deck(num_decks: int = 1) -> list[str]:
     values = [str(v) for v in range(2, 11)] + ["J","Q","K","A"]
@@ -620,6 +638,30 @@ def reset_to_lobby(message: str | None = None) -> None:
     broadcast_lobby()
 
 
+def reset_to_setup_keep_connections(message: str | None = None) -> None:
+    """
+    Host returns to the setup screen (game select / target score) while keeping clients connected.
+    Clients are sent to the lobby view via broadcast_lobby().
+    """
+    global game_started, match_over, match_winner, match_end_reason, round_over, last_round_summary, turn_order, current_turn_idx, turn_phase, turn_open_discard
+    game_started = False
+    match_over = False
+    match_winner = None
+    match_end_reason = None
+    round_over = False
+    last_round_summary = None
+    turn_order = []
+    current_turn_idx = 0
+    turn_phase = {}
+    turn_open_discard = {}
+    if message:
+        global status_line
+        status_line = message
+    sync_player_order()
+    globals()["state"] = STATE_MENU
+    broadcast_lobby()
+
+
 def close_game_by_host() -> None:
     """
     Host closes the game: regardless of players remaining, end match with reason and disconnect everyone.
@@ -878,6 +920,7 @@ while running:
         draw_panel(panel_left, "Setup")
         screen.blit(FONT.render("Select a game to host:", True, (230, 235, 245)), (panel_left.x + 20, 130))
         draw_button(btn_game_least, enabled=True)
+        host_name_input.draw("Host name")
         points_input.draw("Out after points >")
         screen.blit(FONT_XS.render("(Example: 200 → out at 201)", True, (205, 215, 230)), (points_input.rect.x, points_input.rect.bottom + 6))
         draw_button(btn_to_lobby, enabled=True)
@@ -885,7 +928,7 @@ while running:
 
     elif state == STATE_LOBBY:
         draw_panel(panel_left, "Lobby")
-        screen.blit(FONT.render("Lobby", True, (230, 235, 245)), (panel_left.x + 20, 110))
+        # (Title already drawn by draw_panel)
         screen.blit(
             FONT_SM.render(f"Listening on port {PORT}. Connected players:", True, (200, 210, 225)),
             (panel_left.x + 20, 146),
@@ -902,7 +945,7 @@ while running:
             ry = start_y + idx * row_h
             if ry + row_h > panel_left.bottom - 90:
                 break
-            name = "Host" if pid == HOST_ID else player_names.get(pid, f"Player {pid}")
+            name = player_names.get(pid, f"Player {pid}")
             is_dealer = pid == dealer_pid
             # row background
             row_rect = pygame.Rect(panel_left.x + 16, ry, panel_left.width - 32, 38)
@@ -924,7 +967,8 @@ while running:
 
             # order index + name
             screen.blit(FONT_XS.render(f"{idx+1}.", True, (235, 240, 248)), (row_rect.x + 42, row_rect.y + 10))
-            screen.blit(FONT.render(name, True, (245, 245, 245)), (row_rect.x + 70, row_rect.y + 6))
+            # Use smaller font here so longer names still fit
+            screen.blit(FONT_SM.render(str(name)[:16], True, (245, 245, 245)), (row_rect.x + 70, row_rect.y + 8))
             if is_dealer:
                 screen.blit(FONT_XS.render("Dealer", True, (255, 235, 120)), (row_rect.x + 70, row_rect.y + 22))
 
@@ -949,9 +993,27 @@ while running:
         pids = [HOST_ID] + sorted([pid for pid in scores_total.keys() if pid != HOST_ID])
         col0_w = 80
         remaining = max(1, inner.width - col0_w)
-        col_w = max(100, remaining // max(1, len(pids)))
-        max_cols = max(1, min(len(pids), remaining // 100))
+        # Compact columns: fit to header/value widths, don't stretch to fill.
+        col_padding = 16
+        widths: list[int] = []
+        for pid in pids:
+            nm = player_names.get(pid, f"P{pid}")
+            nm_w = FONT_XS.render(str(nm)[:10], True, (0, 0, 0)).get_width()
+            tot_w = FONT_XS.render(str(scores_total.get(pid, 0)), True, (0, 0, 0)).get_width()
+            cards = len(hands.get(pid, [])) if pid in turn_order else "-"
+            cards_w = FONT_XS.render(str(cards), True, (0, 0, 0)).get_width()
+            widths.append(max(90, nm_w, tot_w, cards_w) + col_padding)
+        # Cap columns to available space
+        used = 0
+        max_cols = 0
+        for w in widths:
+            if max_cols > 0 and (used + w) > remaining:
+                break
+            used += w
+            max_cols += 1
+        max_cols = max(1, max_cols)
         pids = pids[:max_cols]
+        widths = widths[:max_cols]
 
         # header row (pinned)
         header_rect = pygame.Rect(inner.x, inner.y, inner.width, header_h)
@@ -960,9 +1022,9 @@ while running:
 
         active_pid = turn_order[current_turn_idx] if turn_order else None
         for i, pid in enumerate(pids):
-            name = "Host" if pid == HOST_ID else player_names.get(pid, f"P{pid}")
-            x = header_rect.x + col0_w + i * col_w
-            col_rect = pygame.Rect(x, header_rect.y, col_w, header_h)
+            name = player_names.get(pid, f"P{pid}")
+            x = header_rect.x + col0_w + sum(widths[:i])
+            col_rect = pygame.Rect(x, header_rect.y, widths[i], header_h)
             if (pid == active_pid) and (not round_over):
                 pygame.draw.rect(screen, (255, 235, 120), col_rect, border_radius=10)
                 fg = (20, 20, 20)
@@ -985,7 +1047,7 @@ while running:
             screen.blit(FONT_XS.render(str(rno), True, (235, 240, 248)), (body_rect.x + 8, y + 2))
             for i, pid in enumerate(pids):
                 pts = pts_map.get(pid, pts_map.get(str(pid), 0))
-                x = body_rect.x + col0_w + i * col_w
+                x = body_rect.x + col0_w + sum(widths[:i])
                 screen.blit(FONT_XS.render(str(pts), True, (235, 240, 248)), (x + 6, y + 2))
             y += row_h
 
@@ -995,12 +1057,12 @@ while running:
         screen.blit(FONT_XS.render("Total", True, (210, 220, 235)), (footer_rect.x + 8, footer_rect.y + 4))
         for i, pid in enumerate(pids):
             total = scores_total.get(pid, 0)
-            x = footer_rect.x + col0_w + i * col_w
+            x = footer_rect.x + col0_w + sum(widths[:i])
             screen.blit(FONT_XS.render(str(total), True, (235, 240, 248)), (x + 6, footer_rect.y + 4))
         screen.blit(FONT_XS.render("Cards", True, (210, 220, 235)), (footer_rect.x + 8, footer_rect.y + 24))
         for i, pid in enumerate(pids):
             count = len(hands.get(pid, [])) if pid in turn_order else "-"
-            x = footer_rect.x + col0_w + i * col_w
+            x = footer_rect.x + col0_w + sum(widths[:i])
             txt = str(count)
             if (pid == active_pid) and (not round_over):
                 txt = f"{txt} *"
@@ -1028,7 +1090,7 @@ while running:
         draw_button(btn_show, enabled=can_show)
         # Control buttons: next round only when round_over and match not over.
         if match_over:
-            draw_button(btn_back_lobby, enabled=True)
+            draw_button(Button(btn_back_lobby.rect, "Back to Setup"), enabled=True)
         elif round_over:
             draw_button(btn_next_round, enabled=True)
         draw_button(btn_exit_host, enabled=True)
@@ -1073,7 +1135,7 @@ while running:
             sy = rect.y + 10
             for i in range(stacks):
                 screen.blit(back_small, (sx + i * 6, sy + i * 2))
-            label = "Host" if pid == HOST_ID else f"P{pid}"
+            label = player_names.get(pid, f"P{pid}")
             screen.blit(FONT_XS.render(f"{label} ({count})", True, (235, 240, 248)), (rect.x + 10, rect.bottom - 20))
 
         active_pid = turn_order[current_turn_idx] if turn_order else None
@@ -1147,7 +1209,7 @@ while running:
                     pygame.draw.rect(screen, (0, 0, 0), badge.move(0, 2), border_radius=8)
                     pygame.draw.rect(screen, (255, 235, 120), badge, border_radius=8)
                     screen.blit(FONT_XS.render(f"x{cnt}", True, (20, 20, 20)), (badge.x + 6, badge.y + 5))
-                label = "Host" if who == HOST_ID else player_names.get(who, f"P{who}")
+                label = player_names.get(who, f"P{who}")
                 msg = f"{label} discarded {cnt}×{face}"
                 screen.blit(FONT_XS.render(msg, True, (235, 240, 248)), (discard_rect.x - 10, discard_rect.bottom + 6))
 
@@ -1191,6 +1253,7 @@ while running:
 
         if state == STATE_MENU:
             points_input.handle_event(event)
+            host_name_input.handle_event(event)
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pos = to_canvas(event.pos)
@@ -1199,6 +1262,9 @@ while running:
                 if btn_game_least.rect.collidepoint(pos):
                     status_line = "Least Count selected. Create a lobby to start."
                 elif btn_to_lobby.rect.collidepoint(pos):
+                    # Persist host name (visible to clients in lobby + table)
+                    nm = host_name_input.value.strip()
+                    player_names[HOST_ID] = nm if nm else "Host"
                     # Apply config
                     try:
                         val = int(points_input.value.strip() or "200")
@@ -1209,7 +1275,6 @@ while running:
                         max_points_out = 200
                     state = STATE_LOBBY
                     status_line = "Lobby created. Waiting for players to connect..."
-                    player_names[HOST_ID] = "Host"
                     broadcast_lobby()
 
             elif state == STATE_LOBBY:
@@ -1251,7 +1316,7 @@ while running:
                     close_game_by_host()
                     break
                 if btn_back_lobby.rect.collidepoint(pos) and match_over:
-                    reset_to_lobby("Back to lobby.")
+                    reset_to_setup_keep_connections("Back to setup.")
                     break
                 if btn_next_round.rect.collidepoint(pos) and round_over and (not match_over):
                     # Continue match if possible
