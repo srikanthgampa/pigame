@@ -270,6 +270,7 @@ scroll_rows_from_bottom = 0  # for scoreboard scrolling (round rows only)
 dealer_pid: int | None = None
 match_over: bool = False
 match_winner: int | None = None
+last_discard: dict | None = None
 
 # Layout
 panel_left = pygame.Rect(40, 40, 360, 560)
@@ -426,6 +427,7 @@ while running:
             dealer_pid = st.get("dealer_pid")
             match_over = bool(st.get("match_over", False))
             match_winner = st.get("match_winner")
+            last_discard = st.get("last_discard")
             continue
 
         if action == "round_end":
@@ -636,6 +638,22 @@ while running:
         else:
             blank = get_sprite("BlankCard", (120, 170))
             screen.blit(blank, (discard_rect.x + 15, discard_rect.y + 18))
+
+        # Show how many cards were discarded (when a player drops multiples)
+        if last_discard and isinstance(last_discard.get("t"), int):
+            age = pygame.time.get_ticks() - int(last_discard["t"])
+            if 0 <= age <= 3000:
+                cnt = int(last_discard.get("count", 1) or 1)
+                face = str(last_discard.get("face", ""))
+                who = last_discard.get("pid")
+                if cnt > 1:
+                    badge = pygame.Rect(discard_rect.right - 42, discard_rect.y + 10, 34, 24)
+                    pygame.draw.rect(screen, (0, 0, 0), badge.move(0, 2), border_radius=8)
+                    pygame.draw.rect(screen, (255, 235, 120), badge, border_radius=8)
+                    screen.blit(FONT_XS.render(f"x{cnt}", True, (20, 20, 20)), (badge.x + 6, badge.y + 5))
+                name = player_names.get(who, player_names.get(str(who), f"P{who}"))
+                msg = f"{name} discarded {cnt}×{face}"
+                screen.blit(FONT_XS.render(msg, True, (235, 240, 248)), (discard_rect.x - 10, discard_rect.bottom + 6))
 
         # hand (sorted + overlapping)
         hand = sort_hand(hand)
